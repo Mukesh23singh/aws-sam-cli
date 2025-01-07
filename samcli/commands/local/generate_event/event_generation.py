@@ -6,9 +6,9 @@ import functools
 
 import click
 
-from samcli.lib.generated_sample_events import events
-from samcli.cli.cli_config_file import TomlProvider, configuration_option
+from samcli.cli.cli_config_file import ConfigProvider, configuration_option
 from samcli.cli.options import debug_option
+from samcli.lib.generated_sample_events import events
 from samcli.lib.telemetry.metric import track_command
 from samcli.lib.utils.version_checker import check_newer_version
 
@@ -121,7 +121,6 @@ class EventTypeSubCommand(click.MultiCommand):
         self.events_lib = events_lib
 
     def get_command(self, ctx, cmd_name):
-
         """
         gets the Click Commands underneath a service name
 
@@ -161,7 +160,7 @@ class EventTypeSubCommand(click.MultiCommand):
             callback=command_callback,
         )
 
-        cmd = configuration_option(provider=TomlProvider(section="parameters"))(debug_option(cmd))
+        cmd = configuration_option(provider=ConfigProvider(section="parameters"))(debug_option(cmd))
         return cmd
 
     def list_commands(self, ctx):

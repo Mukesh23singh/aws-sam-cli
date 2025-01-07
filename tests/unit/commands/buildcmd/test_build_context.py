@@ -1,26 +1,28 @@
 import os
 from unittest import TestCase
-from unittest.mock import patch, Mock, ANY, call
+from unittest.mock import MagicMock, patch, Mock, ANY, call
 
 from parameterized import parameterized
 
-from samcli.commands._utils.experimental import ExperimentalFlag
-from samcli.lib.build.build_graph import DEFAULT_DEPENDENCIES_DIR
-from samcli.lib.utils.osutils import BUILD_DIR_PERMISSIONS
-from samcli.lib.utils.packagetype import ZIP, IMAGE
-from samcli.local.lambdafn.exceptions import ResourceNotFound
 from samcli.commands.build.build_context import BuildContext
 from samcli.commands.build.exceptions import InvalidBuildDirException, MissingBuildMethodException
+from samcli.commands.build.utils import MountMode
 from samcli.commands.exceptions import UserException
 from samcli.lib.build.app_builder import (
     BuildError,
     UnsupportedBuilderLibraryVersionError,
     BuildInsideContainerError,
-    ContainerBuildNotSupported,
     ApplicationBuildResult,
 )
+from samcli.lib.build.build_graph import DEFAULT_DEPENDENCIES_DIR
+from samcli.lib.build.bundler import EsbuildBundlerManager
 from samcli.lib.build.workflow_config import UnsupportedRuntimeException
+from samcli.lib.providers.provider import Function, get_function_build_info
+from samcli.lib.telemetry.event import EventName, UsedFeature
+from samcli.lib.utils.osutils import BUILD_DIR_PERMISSIONS
+from samcli.lib.utils.packagetype import ZIP, IMAGE
 from samcli.local.lambdafn.exceptions import FunctionNotFound
+from samcli.local.lambdafn.exceptions import ResourceNotFound
 
 
 class DeepWrap(Exception):
@@ -36,29 +38,53 @@ class DummyLayer:
         self.skip_build = skip_build
 
 
-class DummyFunction:
-    def __init__(
-        self,
-        name,
-        layers=[],
-        inlinecode=None,
-        codeuri="src",
-        imageuri="image:latest",
-        packagetype=ZIP,
-        metadata=None,
-        skip_build=False,
-        runtime=None,
-    ):
-        self.name = name
-        self.layers = layers
-        self.inlinecode = inlinecode
-        self.codeuri = codeuri
-        self.imageuri = imageuri
-        self.full_path = Mock()
-        self.packagetype = packagetype
-        self.metadata = metadata if metadata else {}
-        self.skip_build = skip_build
-        self.runtime = runtime
+def get_function(
+    name,
+    layers=None,
+    inlinecode=None,
+    codeuri="src",
+    imageuri="image:latest",
+    packagetype=ZIP,
+    metadata=None,
+    skip_build=False,
+    runtime=None,
+) -> Function:
+    layers = layers or []
+    metadata = metadata or {}
+    if skip_build:
+        metadata["SkipBuild"] = "True"
+    return Function(
+        function_id=name,
+        functionname=name,
+        name=name,
+        runtime=runtime,
+        memory=None,
+        timeout=None,
+        handler=None,
+        imageuri=imageuri,
+        packagetype=packagetype,
+        imageconfig=None,
+        codeuri=codeuri,
+        environment=None,
+        rolearn=None,
+        layers=layers,
+        events=None,
+        metadata=metadata,
+        inlinecode=inlinecode,
+        codesign_config_arn=None,
+        architectures=None,
+        function_url_config=None,
+        stack_path="",
+        runtime_management_config=None,
+        function_build_info=get_function_build_info(
+            "stack/function", packagetype, inlinecode, codeuri, imageuri, metadata
+        ),
+    )
+
+
+class DummyStack:
+    def __init__(self, resource):
+        self.resources = resource
 
 
 class TestBuildContext__enter__(TestCase):
@@ -88,7 +114,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
 
-        function1 = DummyFunction("func1")
+        function1 = get_function("func1")
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = function1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -139,7 +165,7 @@ class TestBuildContext__enter__(TestCase):
             parameter_overrides={"overrides": "value"},
             global_parameter_overrides={"AWS::Region": "any_aws_region"},
         )
-        SamFunctionProviderMock.assert_called_once_with([stack], False)
+        SamFunctionProviderMock.assert_called_once_with([stack], False, locate_layer_nested=False)
         pathlib_mock.Path.assert_called_once_with("template_file")
         setup_build_dir_mock.assert_called_with("build_dir", True)
         ContainerManagerMock.assert_called_once_with(docker_network_id="network", skip_pull_image=True)
@@ -166,7 +192,7 @@ class TestBuildContext__enter__(TestCase):
         get_buildable_stacks_mock.return_value = ([stack], [])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = None
-        func_provider_mock.get_all.return_value = [DummyFunction("func1"), DummyFunction("func2")]
+        func_provider_mock.get_all.return_value = [get_function("func1"), get_function("func2")]
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
 
         layer_provider_mock = Mock()
@@ -283,7 +309,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
 
-        func1 = DummyFunction("func1", [layer1, layer2])
+        func1 = get_function("func1", [layer1, layer2])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -400,15 +426,15 @@ class TestBuildContext__enter__(TestCase):
         stack = Mock()
         stack.template_dict = template_dict
         get_buildable_stacks_mock.return_value = ([stack], [])
-        func1 = DummyFunction("func1")
-        func2 = DummyFunction("func2")
-        func3_skipped = DummyFunction("func3", inlinecode="def handler(): pass", codeuri=None)
-        func4_skipped = DummyFunction("func4", codeuri="packaged_function.zip")
-        func5_skipped = DummyFunction("func5", codeuri=None, packagetype=IMAGE)
-        func6 = DummyFunction(
+        func1 = get_function("func1")
+        func2 = get_function("func2")
+        func3_skipped = get_function("func3", inlinecode="def handler(): pass", codeuri=None)
+        func4_skipped = get_function("func4", codeuri="packaged_function.zip")
+        func5_skipped = get_function("func5", codeuri=None, packagetype=IMAGE)
+        func6 = get_function(
             "func6", packagetype=IMAGE, metadata={"DockerContext": "/path", "Dockerfile": "DockerFile"}
         )
-        func7_skipped = DummyFunction("func7", skip_build=True)
+        func7_skipped = get_function("func7", skip_build=True)
 
         func_provider_mock = Mock()
         func_provider_mock.get_all.return_value = [
@@ -467,6 +493,7 @@ class TestBuildContext__enter__(TestCase):
         self.assertEqual(context.stacks, [stack])
         self.assertEqual(context.manifest_path_override, os.path.abspath("manifest_path"))
         self.assertEqual(context.mode, "buildmode")
+        self.assertFalse(context.use_base_dir)
         self.assertFalse(context.is_building_specific_resource)
         resources_to_build = context.resources_to_build
         self.assertEqual(resources_to_build.functions, [func1, func2, func6])
@@ -474,11 +501,105 @@ class TestBuildContext__enter__(TestCase):
         get_buildable_stacks_mock.assert_called_once_with(
             "template_file", parameter_overrides={"overrides": "value"}, global_parameter_overrides=None
         )
-        SamFunctionProviderMock.assert_called_once_with([stack], False)
+        SamFunctionProviderMock.assert_called_once_with([stack], False, locate_layer_nested=False)
         pathlib_mock.Path.assert_called_once_with("template_file")
         setup_build_dir_mock.assert_called_with("build_dir", True)
         ContainerManagerMock.assert_called_once_with(docker_network_id="network", skip_pull_image=True)
         func_provider_mock.get_all.assert_called_once()
+
+    @parameterized.expand(
+        [
+            ([], None, None),
+            (["func1", "func2", "func3"], None, None),
+            ([], ("func1",), None),
+            (["func1", "func2", "func3"], ("func2",), None),
+            (["func1"], ("func1"), None),
+            (["func1", "func2", "func3"], ("func1", "func3"), None),
+            (["func1"], ("func1",), "func1"),
+            (["func1", "func2"], ("func2",), "func1"),
+        ]
+    )
+    @patch("samcli.commands.build.build_context.get_template_data")
+    @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
+    @patch("samcli.commands.build.build_context.SamFunctionProvider")
+    @patch("samcli.commands.build.build_context.SamLayerProvider")
+    @patch("samcli.commands.build.build_context.pathlib")
+    @patch("samcli.commands.build.build_context.ContainerManager")
+    def test_must_exclude_functions_from_build(
+        self,
+        resources_to_build,
+        excluded_resources,
+        resource_identifier,
+        ContainerManagerMock,
+        pathlib_mock,
+        SamLayerProviderMock,
+        SamFunctionProviderMock,
+        get_buildable_stacks_mock,
+        get_template_data_mock,
+    ):
+        template_dict = "template dict"
+        stack = Mock()
+        stack.template_dict = template_dict
+        get_buildable_stacks_mock.return_value = ([stack], [])
+
+        funcs = [get_function(f) for f in resources_to_build]
+        resource_to_exclude = None
+        for f in funcs:
+            if f.name == resource_identifier:
+                resource_to_exclude = f
+                break
+
+        func_provider_mock = Mock()
+        func_provider_mock.get_all.return_value = funcs
+        func_provider_mock.get.return_value = resource_to_exclude
+        func_provider_mock.layers.return_value = []
+        funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
+
+        context = BuildContext(
+            resource_identifier,
+            "template_file",
+            None,  # No base dir is provided
+            "build_dir",
+            manifest_path="manifest_path",
+            clean=True,
+            use_container=True,
+            docker_network="network",
+            parameter_overrides={"overrides": "value"},
+            skip_pull_image=True,
+            mode="buildmode",
+            cached=False,
+            cache_dir="cache_dir",
+            parallel=True,
+            excluded_resources=excluded_resources,
+        )
+        setup_build_dir_mock = Mock()
+        build_dir_result = setup_build_dir_mock.return_value = "my/new/build/dir"
+        context._setup_build_dir = setup_build_dir_mock
+
+        # call the enter method
+        result = context.__enter__()
+
+        self.assertEqual(result, context)  # __enter__ must return self
+        self.assertEqual(context.function_provider, funcprovider)
+        self.assertEqual(context.build_dir, build_dir_result)
+        self.assertEqual(context.stacks, [stack])
+        self.assertEqual(context.is_building_specific_resource, bool(resource_identifier))
+        ctx_resources_to_build = context.resources_to_build
+        non_excluded_resources = (
+            [x for x in resources_to_build if x not in excluded_resources] if excluded_resources else resources_to_build
+        )
+
+        if resource_identifier is not None and resource_identifier in excluded_resources:
+            # If building 1 and excluding it, build anyway
+            self.assertTrue(context.is_building_specific_resource)
+            self.assertIn(resource_to_exclude, ctx_resources_to_build.functions)
+        else:
+            named_funcs = [f.name for f in ctx_resources_to_build.functions]
+            if excluded_resources:
+                self.assertTrue(all([x not in named_funcs for x in excluded_resources]))
+                self.assertTrue(all([x in named_funcs for x in non_excluded_resources]))
+            else:
+                self.assertTrue(all([x in named_funcs for x in resources_to_build]))
 
     @parameterized.expand([(["remote_stack_1", "stack.remote_stack_2"], "print_warning"), ([], False)])
     @patch("samcli.commands.build.build_context.LOG")
@@ -541,8 +662,10 @@ class TestBuildContext__enter__(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_run_sync_build_context(
         self,
+        esbuild_bundler_manager_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -556,7 +679,6 @@ class TestBuildContext__enter__(TestCase):
         SamApiProviderMock,
         get_buildable_stacks_mock,
     ):
-
         root_stack = Mock()
         root_stack.is_root_stack = True
         auto_dependency_layer = False
@@ -567,7 +689,7 @@ class TestBuildContext__enter__(TestCase):
             root_stack.stack_path: "./build_dir/template.yaml",
             child_stack.stack_path: "./build_dir/abcd/template.yaml",
         }
-        resources_mock.return_value = Mock()
+        resources_mock.return_value = MagicMock()
 
         builder_mock = ApplicationBuilderMock.return_value = Mock()
         artifacts = "artifacts"
@@ -581,7 +703,7 @@ class TestBuildContext__enter__(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -610,11 +732,9 @@ class TestBuildContext__enter__(TestCase):
             create_auto_dependency_layer=auto_dependency_layer,
             print_success_message=False,
         ) as build_context:
-            with patch("samcli.commands.build.build_context.BuildContext.gen_success_msg") as mock_message:
-                with patch("samcli.commands.build.build_context.BuildContext._check_java_warning") as mock_java_warning:
-                    with patch("samcli.commands.build.build_context.BuildContext._check_esbuild_warning"):
-                        build_context.run()
-                        mock_message.assert_not_called()
+            with patch("samcli.commands.build.build_context.BuildContext._gen_success_msg") as mock_message:
+                build_context.run()
+                mock_message.assert_not_called()
 
 
 class TestBuildContext_setup_build_dir(TestCase):
@@ -784,6 +904,8 @@ class TestBuildContext_setup_cached_and_deps_dir(TestCase):
 
 
 class TestBuildContext_run(TestCase):
+    @parameterized.expand([(True,), (False,)])
+    @patch("samcli.commands.build.build_context.NestedStackManager")
     @patch("samcli.commands.build.build_context.SamLocalStackProvider.get_stacks")
     @patch("samcli.commands.build.build_context.SamApiProvider")
     @patch("samcli.commands.build.build_context.SamFunctionProvider")
@@ -795,10 +917,17 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
+    @patch("samcli.commands.build.build_context.BuildContext._handle_build_pre_processing")
     def test_run_build_context(
         self,
+        auto_dependency_layer,
+        pre_processing_mock,
+        esbuild_bundler_manager_mock,
         os_mock,
+        is_sam_template_mock,
         get_template_data_mock,
         move_template_mock,
         resources_mock,
@@ -810,11 +939,10 @@ class TestBuildContext_run(TestCase):
         SamFunctionProviderMock,
         SamApiProviderMock,
         get_buildable_stacks_mock,
+        nested_stack_manager_mock,
     ):
-
         root_stack = Mock()
         root_stack.is_root_stack = True
-        auto_dependency_layer = False
         root_stack.get_output_template_path = Mock(return_value="./build_dir/template.yaml")
         child_stack = Mock()
         child_stack.get_output_template_path = Mock(return_value="./build_dir/abcd/template.yaml")
@@ -826,7 +954,7 @@ class TestBuildContext_run(TestCase):
 
         builder_mock = ApplicationBuilderMock.return_value = Mock()
         artifacts = "artifacts"
-        builder_mock.build.return_value = ApplicationBuildResult(Mock(), artifacts)
+        application_build_result = builder_mock.build.return_value = ApplicationBuildResult(Mock(), artifacts)
         modified_template_root = "modified template 1"
         modified_template_child = "modified template 2"
         builder_mock.update_template.side_effect = [modified_template_root, modified_template_child]
@@ -836,13 +964,29 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
         base_dir = pathlib_mock.Path.return_value.resolve.return_value.parent = "basedir"
         container_mgr_mock = ContainerManagerMock.return_value = Mock()
         build_dir_mock.return_value = "build_dir"
+
+        given_nested_stack_manager = Mock()
+        given_nested_stack_manager.generate_auto_dependency_layer_stack.side_effect = [
+            modified_template_root,
+            modified_template_child,
+        ]
+        nested_stack_manager_mock.return_value = given_nested_stack_manager
+
+        pre_processing_mock.return_value = [root_stack, child_stack]
+
+        esbuild_manager = EsbuildBundlerManager(Mock())
+        esbuild_manager.set_sourcemap_env_from_metadata = Mock()
+        esbuild_manager.set_sourcemap_env_from_metadata.side_effect = [modified_template_root, modified_template_child]
+        esbuild_manager.esbuild_configured = Mock()
+        esbuild_manager.esbuild_configured.return_value = False
+        esbuild_bundler_manager_mock.return_value = esbuild_manager
 
         with BuildContext(
             resource_identifier="function_identifier",
@@ -863,8 +1007,11 @@ class TestBuildContext_run(TestCase):
             container_env_var_file=None,
             build_images={},
             create_auto_dependency_layer=auto_dependency_layer,
+            build_in_source=False,
+            mount_with=MountMode.READ,
         ) as build_context:
             build_context.run()
+            is_sam_template_mock.assert_called_once_with()
 
             ApplicationBuilderMock.assert_called_once_with(
                 ANY,
@@ -881,6 +1028,8 @@ class TestBuildContext_run(TestCase):
                 container_env_var_file=build_context._container_env_var_file,
                 build_images=build_context._build_images,
                 combine_dependencies=not auto_dependency_layer,
+                build_in_source=build_context._build_in_source,
+                mount_with_write=False,
             )
             builder_mock.build.assert_called_once()
             builder_mock.update_template.assert_has_calls(
@@ -914,12 +1063,28 @@ class TestBuildContext_run(TestCase):
                 ]
             )
 
+            if auto_dependency_layer:
+                nested_stack_manager_mock.assert_has_calls(
+                    [
+                        call(root_stack, "", build_context.build_dir, modified_template_root, application_build_result),
+                        call(
+                            child_stack,
+                            "",
+                            build_context.build_dir,
+                            modified_template_child,
+                            application_build_result,
+                        ),
+                    ],
+                    any_order=True,
+                )
+                # assert that nested stack manager is called by both root stack and child stack
+                given_nested_stack_manager.generate_auto_dependency_layer_stack.assert_has_calls([call(), call()])
+
     @parameterized.expand(
         [
             (UnsupportedRuntimeException(), "UnsupportedRuntimeException"),
             (BuildInsideContainerError(), "BuildInsideContainerError"),
             (BuildError(wrapped_from=DeepWrap().__class__.__name__, msg="Test"), "DeepWrap"),
-            (ContainerBuildNotSupported(), "ContainerBuildNotSupported"),
             (
                 UnsupportedBuilderLibraryVersionError(container_name="name", error_msg="msg"),
                 "UnsupportedBuilderLibraryVersionError",
@@ -938,10 +1103,12 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_must_catch_known_exceptions(
         self,
         exception,
         wrapped_exception,
+        esbuild_bundler_manager_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -955,7 +1122,6 @@ class TestBuildContext_run(TestCase):
         SamApiProviderMock,
         get_buildable_stacks_mock,
     ):
-
         stack = Mock()
         resources_mock.return_value = Mock(functions=[], layers=[])
 
@@ -970,7 +1136,7 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -1017,8 +1183,10 @@ class TestBuildContext_run(TestCase):
     @patch("samcli.commands.build.build_context.move_template")
     @patch("samcli.commands.build.build_context.get_template_data")
     @patch("samcli.commands.build.build_context.os")
+    @patch("samcli.commands.build.build_context.EsbuildBundlerManager")
     def test_must_catch_function_not_found_exception(
         self,
+        source_map_mock,
         os_mock,
         get_template_data_mock,
         move_template_mock,
@@ -1046,7 +1214,7 @@ class TestBuildContext_run(TestCase):
         layer_provider_mock = Mock()
         layer_provider_mock.get.return_value = layer1
         layerprovider = SamLayerProviderMock.return_value = layer_provider_mock
-        func1 = DummyFunction("func1", [layer1])
+        func1 = get_function("func1", [layer1])
         func_provider_mock = Mock()
         func_provider_mock.get.return_value = func1
         funcprovider = SamFunctionProviderMock.return_value = func_provider_mock
@@ -1080,27 +1248,80 @@ class TestBuildContext_run(TestCase):
 
         self.assertEqual(str(ctx.exception), "Function Not Found")
 
+    @patch("samcli.commands.build.build_context.BuildContext._is_sam_template")
+    @patch("samcli.commands.build.build_context.BuildContext.get_resources_to_build")
+    @patch("samcli.commands.build.build_context.BuildContext._check_exclude_warning")
+    @patch("samcli.commands.build.build_context.BuildContext._check_rust_cargo_experimental_flag")
+    @patch("samcli.lib.build.app_builder.ApplicationBuilder.build")
+    @patch("samcli.lib.telemetry.event.EventTracker.track_event")
+    def test_build_in_source_event_sent(
+        self, mock_track_event, mock_builder, mock_rust, mock_warning, mock_get_resources, mock_is_sam_template
+    ):
+        mock_builder.side_effect = [FunctionNotFound()]
 
-class TestBuildContext_java_warning(TestCase):
+        context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            clean=False,
+            parallel=False,
+            mode="mode",
+            build_in_source=True,
+        )
+
+        with self.assertRaises(UserException):
+            context.run()
+
+        mock_track_event.assert_called_with(
+            EventName.USED_FEATURE.value, UsedFeature.BUILD_IN_SOURCE.value, "FunctionNotFound"
+        )
+
+
+class TestBuildContext_is_sam_template(TestCase):
+    @parameterized.expand(
+        [
+            ({"Transform": "AWS::Serverless-2016-10-31"}, True),
+            ({"Transform": ["AWS::Serverless-2016-10-31"]}, True),
+            ({"Transform": ["AWS::Language::Extension", "AWS::Serverless-2016-10-31"]}, True),
+            ({"Transform": ["AWS::Language::Extension"]}, False),
+            ({"Transform": "AWS::Language::Extension"}, False),
+            ({"Transform": 123}, False),
+        ]
+    )
+    @patch("samcli.commands.build.build_context.get_template_data")
+    def test_is_sam_template(self, template_dict, expected_result, get_template_data_mock):
+        get_template_data_mock.return_value = template_dict
+
+        build_context = BuildContext(
+            resource_identifier="",
+            template_file="template_file",
+            base_dir="base_dir",
+            build_dir="build_dir",
+            cache_dir="cache_dir",
+            cached=False,
+            clean=False,
+            parallel=False,
+            mode="mode",
+        )
+        result = build_context._is_sam_template()
+        self.assertEqual(result, expected_result)
+
+
+class TestBuildContext_exclude_warning(TestCase):
     @parameterized.expand(
         [
             ([], [], False),
-            ([DummyFunction("NonJavaFunction", runtime="nodejs14.x")], [], False),
-            ([], [DummyLayer("NonJavaLayer", build_method="nodejs14.x")], False),
-            (
-                [DummyFunction("NonJavaFunction", runtime="nodejs14.x")],
-                [DummyLayer("NonJavaLayer", build_method="nodejs14.x")],
-                False,
-            ),
-            ([DummyFunction("JavaFunction", runtime="java8")], [], True),
-            ([], [DummyLayer("JavaLayer", build_method="java11")], True),
-            ([DummyFunction("JavaFunction", runtime="java11")], [DummyLayer("JavaLayer", build_method="java8")], True),
+            ("Function", ("Function",), True),
+            ("Function", ("NotTheSameFunction",), False),
         ]
     )
-    @patch("samcli.commands.build.build_context.click.secho")
-    def test_check_java_warning(self, functions, layers, should_print, mocked_click):
+    @patch("samcli.commands.build.build_context.LOG")
+    def test_check_exclude_warning(self, resource_id, exclude, should_print, log_mock):
         build_context = BuildContext(
-            resource_identifier="function_identifier",
+            resource_identifier=resource_id,
             template_file="template_file",
             base_dir="base_dir",
             build_dir="build_dir",
@@ -1109,43 +1330,60 @@ class TestBuildContext_java_warning(TestCase):
             clean=False,
             parallel=False,
             mode="mode",
+            excluded_resources=exclude,
         )
-        with patch.object(build_context, "get_resources_to_build") as mocked_resources_to_build:
-            mocked_resources_to_build.return_value = Mock(functions=functions, layers=layers)
-            build_context._check_java_warning()
-
-            if should_print:
-                mocked_click.assert_called_with(BuildContext._JAVA_BUILD_WARNING_MESSAGE, fg="yellow")
-            else:
-                mocked_click.assert_not_called()
-
-
-class TestBuildContext_esbuild_warning(TestCase):
-    @parameterized.expand(
-        [
-            ([], False),
-            ([DummyFunction("Esbuild", metadata={"BuildMethod": "esbuild"})], True),
-            ([DummyFunction("NotEsbuild", metadata={"BuildMethod": "Makefile"})], False),
-        ]
-    )
-    @patch("samcli.commands.build.build_context.prompt_experimental")
-    def test_check_esbuild_warning(self, functions, should_print, mocked_click):
-        build_context = BuildContext(
-            resource_identifier="function_identifier",
-            template_file="template_file",
-            base_dir="base_dir",
-            build_dir="build_dir",
-            cache_dir="cache_dir",
-            cached=False,
-            clean=False,
-            parallel=False,
-            mode="mode",
-        )
-        with patch.object(build_context, "get_resources_to_build") as mocked_resources_to_build:
-            mocked_resources_to_build.return_value = Mock(functions=functions)
-            build_context._check_esbuild_warning()
+        build_context._check_exclude_warning()
 
         if should_print:
-            mocked_click.assert_called_with(ExperimentalFlag.Esbuild, BuildContext._ESBUILD_WARNING_MESSAGE)
+            log_mock.warning.assert_called_once_with(BuildContext._EXCLUDE_WARNING_MESSAGE)
         else:
-            mocked_click.assert_not_called()
+            log_mock.warning.assert_not_called()
+
+
+class TestBuildContext_gen_success_msg(TestCase):
+    def setUp(self):
+        self.build_dir = "build_dir"
+        self.template_file = "template_file"
+
+        self.build_context = BuildContext(
+            resource_identifier="function_identifier",
+            template_file=self.template_file,
+            base_dir="base_dir",
+            build_dir=self.build_dir,
+            cache_dir="cache_dir",
+            parallel=False,
+            mode="mode",
+            cached=False,
+        )
+
+    def test_gen_message_with_non_default_build_without_hook_package(self):
+        self.build_context._hook_name = False
+
+        msg = self.build_context._gen_success_msg(self.build_dir, self.template_file, False)
+        expected_msg = (
+            f"""\nBuilt Artifacts  : build_dir
+Built Template   : template_file\n
+Commands you can use next
+=========================
+[*] Validate SAM template: sam validate{os.linesep}[*] Invoke Function: sam local invoke -t template_file"""
+            f"""{os.linesep}[*] Test Function in the Cloud: sam sync --stack-name {"{{stack-name}}"} --watch"""
+            f"""{os.linesep}[*] Deploy: sam deploy --guided --template-file template_file"""
+        )
+
+        self.assertEqual(msg, expected_msg)
+
+    def test_gen_message_with_non_default_build_with_hook_package(self):
+        self.build_context._hook_name = "iac"
+
+        msg = self.build_context._gen_success_msg(self.build_dir, self.template_file, False)
+        expected_msg = (
+            f"""\nBuilt Artifacts  : build_dir
+Built Template   : template_file
+
+Commands you can use next
+=========================
+[*] Invoke Function: sam local invoke --hook-name iac{os.linesep}[*] Emulate local Lambda functions: sam """
+            """local start-lambda --hook-name iac"""
+        )
+
+        self.assertEqual(msg, expected_msg)

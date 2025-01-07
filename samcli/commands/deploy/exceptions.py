@@ -1,6 +1,7 @@
 """
 Exceptions that are raised by sam deploy
 """
+
 from samcli.commands.exceptions import UserException
 
 
@@ -56,7 +57,6 @@ class DeployBucketInDifferentRegionError(UserException):
 
 class DeployBucketRequiredError(UserException):
     def __init__(self):
-
         message_fmt = (
             "Templates with a size greater than 51,200 bytes must be deployed "
             "via an S3 Bucket. Please add the --s3-bucket parameter to your "
@@ -75,3 +75,9 @@ class DeployResolveS3AndS3SetError(UserException):
         )
 
         super().__init__(message=message_fmt)
+
+
+class DeployStackStatusMissingError(UserException):
+    def __init__(self, stack_name):
+        message_fmt = "Was not able to find a stack with the name: {msg}, please check your parameters and try again."
+        super().__init__(message=message_fmt.format(msg=stack_name))

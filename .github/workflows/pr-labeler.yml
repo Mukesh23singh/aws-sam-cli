@@ -9,19 +9,26 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/labeler@v3
+    - uses: actions/labeler@v5
       with:
         repo-token: "${{ secrets.GITHUB_TOKEN }}"
   apply-internal-external-label:
+    needs: apply-file-based-labels
+    if: ${{ always() }}
     permissions:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v5
+      - uses: actions/github-script@v7
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
-            const maintainers = ['jfuss', 'c2tarun', 'hoffa', 'awood45', 'CoshUS', 'aahung', 'hawflau', 'mndeveci', 'ssenchenko', 'wchengru', 'mingkun2020', 'qingchm', 'moelasmar', 'xazhao', 'mildaniel', 'marekaiv', 'torresxb1']
+            const maintainers = [
+              'aws-sam-cli-bot',
+              'hawflau', 'mndeveci',
+              'mildaniel', 'marekaiv',
+              'lucashuy', 'hnnasit', 'jysheng123', 'bentvelj', 'sidhujus', 'dependabot[bot]'
+            ]
             if (maintainers.includes(context.payload.sender.login)) {
               github.rest.issues.addLabels({
                 issue_number: context.issue.number,
@@ -34,6 +41,6 @@ jobs:
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                labels: ['pr/external']
+                labels: ['pr/external', 'stage/needs-triage']
               })
             }

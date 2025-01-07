@@ -1,3 +1,5 @@
+import signal
+from unittest import skipIf
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import time, sleep
@@ -13,6 +15,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from samcli.commands.local.cli_common.invoke_context import ContainersInitializationMode
+from tests.testing_utils import IS_WINDOWS
 from .start_lambda_api_integ_base import StartLambdaIntegBaseClass, WatchWarmContainersIntegBaseClass
 
 
@@ -107,6 +110,46 @@ class TestLambdaServiceErrorCases(StartLambdaIntegBaseClass):
             self.lambda_client.invoke(FunctionName="EchoEventFunction", InvocationType="DryRun")
 
         self.assertEqual(str(error.exception), expected_error_message)
+
+
+class TestLambdaServiceWithInlineCode(StartLambdaIntegBaseClass):
+    template_path = "/testdata/invoke/template-inlinecode.yaml"
+
+    def setUp(self):
+        self.url = "http://127.0.0.1:{}".format(self.port)
+        self.lambda_client = boto3.client(
+            "lambda",
+            endpoint_url=self.url,
+            region_name="us-east-1",
+            use_ssl=False,
+            verify=False,
+            config=Config(signature_version=UNSIGNED, read_timeout=120, retries={"max_attempts": 0}),
+        )
+
+    @pytest.mark.flaky(reruns=3)
+    @pytest.mark.timeout(timeout=300, method="thread")
+    def test_invoke_function_with_inline_code(self):
+        expected_error_message = (
+            "An error occurred (NotImplemented) when calling the Invoke operation:"
+            " Inline code is not supported for sam local commands. Please write your code in a separate file."
+        )
+
+        with self.assertRaises(ClientError) as error:
+            self.lambda_client.invoke(FunctionName="InlineCodeServerlessFunction", Payload='"This is json data"')
+
+        self.assertEqual(str(error.exception), expected_error_message)
+
+    @pytest.mark.flaky(reruns=3)
+    @pytest.mark.timeout(timeout=300, method="thread")
+    def test_invoke_function_without_inline_code(self):
+        response = self.lambda_client.invoke(
+            FunctionName="NoInlineCodeServerlessFunction",
+            Payload='"This is json data"',
+        )
+
+        self.assertEqual(response.get("Payload").read().decode("utf-8"), '"This is json data"')
+        self.assertIsNone(response.get("FunctionError"))
+        self.assertEqual(response.get("StatusCode"), 200)
 
 
 @parameterized_class(
@@ -217,19 +260,8 @@ class TestLambdaService(StartLambdaIntegBaseClass):
         )
         response_data = json.loads(response.get("Payload").read().decode("utf-8"))
 
-        print(response_data)
-
-        self.assertEqual(
-            response_data,
-            {
-                "errorMessage": "Lambda is raising an exception",
-                "errorType": "Exception",
-                "stackTrace": [
-                    ["/var/task/main.py", 51, "raise_exception", 'raise Exception("Lambda is raising an exception")']
-                ],
-            },
-        )
-        self.assertEqual(response.get("FunctionError"), "Unhandled")
+        self.assertEqual(response_data.get("errorMessage"), "Lambda is raising an exception")
+        self.assertEqual(response_data.get("errorType"), "Exception")
         self.assertEqual(response.get("StatusCode"), 200)
 
     @parameterized.expand([("False"), ("True")])
@@ -248,6 +280,28 @@ class TestLambdaService(StartLambdaIntegBaseClass):
         """
         response = self.lambda_client.invoke(
             FunctionName=f"{self.parent_path if use_full_path == 'True' else ''}TimeoutFunction"
+        )
+
+        self.assertEqual(response.get("Payload").read().decode("utf-8"), "")
+        self.assertIsNone(response.get("FunctionError"))
+        self.assertEqual(response.get("StatusCode"), 200)
+
+    @parameterized.expand([("False"), ("True")])
+    @pytest.mark.flaky(reruns=3)
+    @pytest.mark.timeout(timeout=300, method="thread")
+    def test_invoke_with_function_timeout_using_lookup_value(self, use_full_path):
+        """
+        This behavior does not match the actually Lambda Service. For functions that timeout, data returned like the
+        following:
+        {"errorMessage":"<timestamp> <request_id> Task timed out after 5.00 seconds"}
+
+        For Local Lambda's, however, timeouts are an interrupt on the thread that runs invokes the function. Since the
+        invoke is on a different thread, we do not (currently) have a way to communicate this back to the caller. So
+        when a timeout happens locally, we do not add the FunctionError: Unhandled to the response and have an empty
+        string as the data returned (because no data was found in stdout from the container).
+        """
+        response = self.lambda_client.invoke(
+            FunctionName=f"{self.parent_path if use_full_path == 'True' else ''}TimeoutFunctionUsingLookupValue"
         )
 
         self.assertEqual(response.get("Payload").read().decode("utf-8"), "")
@@ -275,6 +329,12 @@ class TestWarmContainersBaseClass(StartLambdaIntegBaseClass):
                 running_containers += 1
         return running_containers
 
+    def tearDown(self) -> None:
+        # Use a new container test UUID for the next test run to avoid
+        # counting additional containers in the event of a retry
+        self.mode_env_variable = str(uuid.uuid4())
+        super().tearDown()
+
 
 @parameterized_class(
     ("template_path",),
@@ -297,6 +357,38 @@ class TestWarmContainers(TestWarmContainersBaseClass):
         response = json.loads(result.get("Payload").read().decode("utf-8"))
         self.assertEqual(response.get("statusCode"), 200)
         self.assertEqual(json.loads(response.get("body")), {"hello": "world"})
+
+
+@skipIf(IS_WINDOWS, "SIGTERM interrupt doesn't exist on Windows")
+class TestWarmContainersHandlesSigTermInterrupt(TestWarmContainersBaseClass):
+    template_path = "/testdata/start_api/template-warm-containers.yaml"
+    container_mode = ContainersInitializationMode.EAGER.value
+    mode_env_variable = str(uuid.uuid4())
+    parameter_overrides = {"ModeEnvVariable": mode_env_variable}
+
+    @pytest.mark.flaky(reruns=3)
+    @pytest.mark.timeout(timeout=600, method="thread")
+    def test_can_invoke_lambda_function_successfully(self):
+        result = self.lambda_client.invoke(FunctionName="HelloWorldFunction")
+        self.assertEqual(result.get("StatusCode"), 200)
+
+        response = json.loads(result.get("Payload").read().decode("utf-8"))
+        self.assertEqual(response.get("statusCode"), 200)
+        self.assertEqual(json.loads(response.get("body")), {"hello": "world"})
+
+        initiated_containers = self.count_running_containers()
+        self.assertEqual(initiated_containers, 2)
+
+        service_process = self.start_lambda_process
+        service_process.send_signal(signal.SIGTERM)
+
+        # Sleep for 10 seconds since this is the default time that Docker
+        # allows for a process to handle a SIGTERM before sending a SIGKILL
+        sleep(10)
+
+        remaining_containers = self.count_running_containers()
+        self.assertEqual(remaining_containers, 0)
+        self.assertEqual(service_process.poll(), 0)
 
 
 @parameterized_class(
@@ -334,7 +426,6 @@ class TestWarmContainersMultipleInvoke(TestWarmContainersBaseClass):
     @pytest.mark.flaky(reruns=3)
     @pytest.mark.timeout(timeout=600, method="thread")
     def test_no_new_created_containers_after_lambda_function_invoke(self):
-
         initiated_containers_before_invoking_any_function = self.count_running_containers()
         result = self.lambda_client.invoke(FunctionName="HelloWorldFunction")
         initiated_containers = self.count_running_containers()
@@ -507,7 +598,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -570,7 +661,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -587,7 +678,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -600,7 +691,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler2
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -673,7 +764,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -690,7 +781,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -703,7 +794,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler2
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -776,7 +867,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -793,7 +884,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main2.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: dir
       Timeout: 600
       Events:
@@ -854,7 +945,7 @@ def handler(event, context):
 class TestWatchingImageWarmContainers(WatchWarmContainersIntegBaseClass):
     template_content = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -888,7 +979,7 @@ def handler(event, context):
 
 def handler(event, context):
     return {"statusCode": 200, "body": json.dumps({"hello": "world2"})}"""
-    docker_file_content = """FROM public.ecr.aws/lambda/python:3.7
+    docker_file_content = """FROM public.ecr.aws/lambda/python:3.11
 COPY main.py ./"""
     container_mode = ContainersInitializationMode.EAGER.value
     build_before_invoke = True
@@ -932,7 +1023,7 @@ COPY main.py ./"""
 class TestWatchingTemplateChangesDockerFileLocationChanged(WatchWarmContainersIntegBaseClass):
     template_content = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -960,7 +1051,7 @@ Resources:
         """
     template_content_2 = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -994,7 +1085,7 @@ def handler(event, context):
 
 def handler(event, context):
     return {"statusCode": 200, "body": json.dumps({"hello": "world2"})}"""
-    docker_file_content = """FROM public.ecr.aws/lambda/python:3.7
+    docker_file_content = """FROM public.ecr.aws/lambda/python:3.11
 COPY main.py ./"""
     container_mode = ContainersInitializationMode.EAGER.value
     build_before_invoke = True
@@ -1045,7 +1136,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -1103,7 +1194,7 @@ def handler(event, context):
 class TestWatchingImageLazyContainers(WatchWarmContainersIntegBaseClass):
     template_content = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -1137,7 +1228,7 @@ def handler(event, context):
 
 def handler(event, context):
     return {"statusCode": 200, "body": json.dumps({"hello": "world2"})}"""
-    docker_file_content = """FROM public.ecr.aws/lambda/python:3.7
+    docker_file_content = """FROM public.ecr.aws/lambda/python:3.11
 COPY main.py ./"""
     container_mode = ContainersInitializationMode.LAZY.value
     build_before_invoke = True
@@ -1186,7 +1277,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -1203,7 +1294,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -1216,7 +1307,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler2
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -1289,7 +1380,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -1306,7 +1397,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -1319,7 +1410,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler2
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: .
       Timeout: 600
       Events:
@@ -1392,7 +1483,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main.handler
-      Runtime: python3.6
+      Runtime: python3.9
       CodeUri: .
       Timeout: 600
       Events:
@@ -1409,7 +1500,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: main2.handler
-      Runtime: python3.7
+      Runtime: python3.11
       CodeUri: dir
       Timeout: 600
       Events:
@@ -1470,7 +1561,7 @@ def handler(event, context):
 class TestWatchingTemplateChangesDockerFileLocationChangedLazyContainer(WatchWarmContainersIntegBaseClass):
     template_content = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -1498,7 +1589,7 @@ Resources:
         """
     template_content_2 = """AWSTemplateFormatVersion : '2010-09-09'
 Transform: AWS::Serverless-2016-10-31    
-Parameteres:
+Parameters:
   Tag:
     Type: String
   ImageUri:
@@ -1532,7 +1623,7 @@ def handler(event, context):
 
 def handler(event, context):
     return {"statusCode": 200, "body": json.dumps({"hello": "world2"})}"""
-    docker_file_content = """FROM public.ecr.aws/lambda/python:3.7
+    docker_file_content = """FROM public.ecr.aws/lambda/python:3.11
 COPY main.py ./"""
     container_mode = ContainersInitializationMode.LAZY.value
     build_before_invoke = True
@@ -1583,10 +1674,9 @@ COPY main.py ./"""
     ],
 )
 class TestLambdaServiceWithCustomInvokeImages(StartLambdaIntegBaseClass):
-
     invoke_image = [
-        "amazon/aws-sam-cli-emulation-image-python3.6",
-        "HelloWorldServerlessFunction=public.ecr.aws/sam/emulation-python3.6",
+        "amazon/aws-sam-cli-emulation-image-python3.9",
+        "HelloWorldServerlessFunction=public.ecr.aws/sam/emulation-python3.9",
     ]
 
     def setUp(self):

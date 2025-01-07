@@ -1,36 +1,27 @@
 import os
-import shutil
 import tempfile
-import time
 import uuid
-import json
-
 from pathlib import Path
 from unittest import skipIf
 
-import boto3
-from botocore.exceptions import ClientError
+import botocore
 import docker
-from botocore.config import Config
+from botocore.exceptions import ClientError
 from parameterized import parameterized
 
 from samcli.lib.bootstrap.bootstrap import SAM_CLI_STACK_NAME
-from samcli.lib.config.samconfig import DEFAULT_CONFIG_FILE_NAME
+from samcli.lib.config.samconfig import DEFAULT_CONFIG_FILE_NAME, SamConfig
 from tests.integration.deploy.deploy_integ_base import DeployIntegBase
-from tests.integration.package.package_integ_base import PackageIntegBase
-from tests.testing_utils import RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, RUN_BY_CANARY
-from tests.testing_utils import run_command, run_command_with_input
-from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack
+from tests.testing_utils import RUNNING_ON_CI, RUNNING_TEST_FOR_MASTER_ON_CI, RUN_BY_CANARY, UpdatableSARTemplate
 
 # Deploy tests require credentials and CI/CD will only add credentials to the env if the PR is from the same repo.
 # This is to restrict package tests to run outside of CI/CD, when the branch is not master or tests are not run by Canary
 SKIP_DEPLOY_TESTS = RUNNING_ON_CI and RUNNING_TEST_FOR_MASTER_ON_CI and not RUN_BY_CANARY
-CFN_SLEEP = 3
 CFN_PYTHON_VERSION_SUFFIX = os.environ.get("PYTHON_VERSION", "0.0.0").replace(".", "-")
 
 
 @skipIf(SKIP_DEPLOY_TESTS, "Skip deploy tests in CI/CD only")
-class TestDeploy(PackageIntegBase, DeployIntegBase):
+class TestDeploy(DeployIntegBase):
     @classmethod
     def setUpClass(cls):
         cls.docker_client = docker.from_env()
@@ -47,31 +38,11 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
         # setup signing profile arn & name
         cls.signing_profile_name = os.environ.get("AWS_SIGNING_PROFILE_NAME")
         cls.signing_profile_version_arn = os.environ.get("AWS_SIGNING_PROFILE_VERSION_ARN")
-        PackageIntegBase.setUpClass()
-        DeployIntegBase.setUpClass()
+        super().setUpClass()
 
     def setUp(self):
-        self.cfn_client = boto3.client("cloudformation")
-        self.ecr_client = boto3.client("ecr")
         self.sns_arn = os.environ.get("AWS_SNS")
-        self.stacks = []
-        time.sleep(CFN_SLEEP)
         super().setUp()
-
-    def tearDown(self):
-        shutil.rmtree(os.path.join(os.getcwd(), ".aws-sam", "build"), ignore_errors=True)
-        for stack in self.stacks:
-            # because of the termination protection, do not delete aws-sam-cli-managed-default stack
-            stack_name = stack["name"]
-            if stack_name != SAM_CLI_STACK_NAME:
-                region = stack.get("region")
-                cfn_client = (
-                    self.cfn_client if not region else boto3.client("cloudformation", config=Config(region_name=region))
-                )
-                ecr_client = self.ecr_client if not region else boto3.client("ecr", config=Config(region_name=region))
-                self._delete_companion_stack(cfn_client, ecr_client, self._stack_name_to_companion_stack(stack_name))
-                cfn_client.delete_stack(StackName=stack_name)
-        super().tearDown()
 
     @parameterized.expand(
         [
@@ -85,9 +56,12 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
         with tempfile.NamedTemporaryFile(delete=False) as output_template_file:
             # Package necessary artifacts.
             package_command_list = self.get_command_list(
-                s3_bucket=self.s3_bucket.name, template=template_path, output_template_file=output_template_file.name
+                template=template_path,
+                s3_bucket=self.s3_bucket.name,
+                s3_prefix=self.s3_prefix,
+                output_template_file=output_template_file.name,
             )
-            package_process = run_command(command_list=package_command_list)
+            package_process = self.run_command(command_list=package_command_list)
 
             self.assertEqual(package_process.process.returncode, 0)
 
@@ -109,7 +83,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
                 tags="integ=true clarity=yes foo_bar=baz",
             )
 
-            deploy_process_no_execute = run_command(deploy_command_list_no_execute)
+            deploy_process_no_execute = self.run_command(deploy_command_list_no_execute)
             self.assertEqual(deploy_process_no_execute.process.returncode, 0)
 
             # Deploy the given stack with the changeset.
@@ -125,7 +99,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
                 tags="integ=true clarity=yes foo_bar=baz",
             )
 
-            deploy_process = run_command(deploy_command_list_execute)
+            deploy_process = self.run_command(deploy_command_list_execute)
             self.assertEqual(deploy_process.process.returncode, 0)
 
     @parameterized.expand(
@@ -157,8 +131,62 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+    @parameterized.expand(["template-image-load.yaml"])
+    def test_deploy_directly_from_image_archive(self, template_file):
+        template_path = self.test_data_path.joinpath(os.path.join("load-image-archive", template_file))
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # Package and Deploy in one go without confirming change set.
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+    @parameterized.expand(["template-image-load-fail.yaml"])
+    def test_deploy_directly_from_image_archive_but_error_fail(self, template_file):
+        template_path = self.test_data_path.joinpath(os.path.join("load-image-archive", template_file))
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # Package and Deploy in one go without confirming change set.
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
 
     @parameterized.expand(
         [
@@ -191,7 +219,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(
@@ -231,7 +259,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(
@@ -265,7 +293,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             resolve_image_repos=True,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         companion_stack_name = self._stack_name_to_companion_stack(stack_name)
         self._assert_companion_stack(self.cfn_client, companion_stack_name)
@@ -296,7 +324,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
 
         deploy_command_list.append("--no-confirm-changeset")
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(["aws-serverless-function.yaml", "cdk_v1_synthesized_template_zip_functions.json"])
@@ -305,7 +333,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
         # Build project
         build_command_list = self.get_minimal_build_command_list(template_file=template_path)
 
-        run_command(build_command_list)
+        self.run_command(build_command_list)
         stack_name = self._method_to_stack_name(self.id())
         self.stacks.append({"name": stack_name})
         # Should result in a zero exit code.
@@ -323,16 +351,16 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         # ReBuild project, absolutely nothing has changed, will result in same build artifacts.
 
-        run_command(build_command_list)
+        self.run_command(build_command_list)
 
         # Re-deploy, this should cause an empty changeset error and not re-deploy.
         # This will cause a non zero exit code.
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Does not cause a re-deploy
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
@@ -359,7 +387,7 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=True,
         )
 
-        deploy_process_execute = run_command_with_input(deploy_command_list, "Y".encode())
+        deploy_process_execute = self.run_command_with_input(deploy_command_list, "Y".encode())
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(["aws-serverless-function.yaml", "cdk_v1_synthesized_template_zip_functions.json"])
@@ -383,7 +411,40 @@ class TestDeploy(PackageIntegBase, DeployIntegBase):
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
+        # Error asking for s3 bucket
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+        self.assertIn(
+            bytes(
+                f"S3 Bucket not specified, use --s3-bucket to specify a bucket name, or use --resolve-s3 \
+to create a managed default bucket, or run sam deploy --guided",
+                encoding="utf-8",
+            ),
+            deploy_process_execute.stderr,
+        )
+
+    def test_deploy_with_no_resolve_s3_option(self):
+        template_path = self.test_data_path.joinpath("aws-serverless-function.yaml")
+
+        stack_name = self._method_to_stack_name(self.id())
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_command_list.append("--no-resolve-s3")
+
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Error asking for s3 bucket
         self.assertEqual(deploy_process_execute.process.returncode, 1)
         self.assertIn(
@@ -413,7 +474,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 2)
 
     @parameterized.expand(["aws-serverless-function.yaml", "cdk_v1_synthesized_template_zip_functions.json"])
@@ -436,7 +497,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
     def test_deploy_without_template_file(self):
@@ -455,7 +516,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Error template file not specified
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
@@ -482,7 +543,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should succeed
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
@@ -503,7 +564,7 @@ to create a managed default bucket, or run sam deploy --guided",
             region="eu-west-2",
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should fail, asking for s3 bucket
         self.assertEqual(deploy_process_execute.process.returncode, 1)
         stderr = deploy_process_execute.stderr.strip()
@@ -542,14 +603,14 @@ to create a managed default bucket, or run sam deploy --guided",
         print("######################################")
         print(deploy_command_list)
         print("######################################")
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should succeed
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
         # Deploy with `--no-fail-on-empty-changeset` after deploying the same template first
         deploy_command_list = self.get_deploy_command_list(fail_on_empty_changeset=False, **kwargs)
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should not fail
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         stdout = deploy_process_execute.stdout.strip()
@@ -579,14 +640,14 @@ to create a managed default bucket, or run sam deploy --guided",
         }
         deploy_command_list = self.get_deploy_command_list(**kwargs)
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should succeed
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
         # Deploy with `--fail-on-empty-changeset` after deploying the same template first
         deploy_command_list = self.get_deploy_command_list(fail_on_empty_changeset=True, **kwargs)
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         # Deploy should not fail
         self.assertNotEqual(deploy_process_execute.process.returncode, 0)
         stderr = deploy_process_execute.stderr.strip()
@@ -599,9 +660,9 @@ to create a managed default bucket, or run sam deploy --guided",
         self.stacks.append({"name": stack_name})
 
         deploy_command_list = self.get_deploy_command_list(
-            template_file=template_path, stack_name=stack_name, capabilities="CAPABILITY_IAM"
+            template_file=template_path, stack_name=stack_name, s3_prefix=self.s3_prefix, capabilities="CAPABILITY_IAM"
         )
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand([("aws-serverless-inline.yaml", "samconfig-read-boolean-tomlkit.toml")])
@@ -613,9 +674,13 @@ to create a managed default bucket, or run sam deploy --guided",
         self.stacks.append({"name": stack_name})
 
         deploy_command_list = self.get_deploy_command_list(
-            template_file=template_path, stack_name=stack_name, config_file=config_path, capabilities="CAPABILITY_IAM"
+            template_file=template_path,
+            stack_name=stack_name,
+            s3_prefix=self.s3_prefix,
+            config_file=config_path,
+            capabilities="CAPABILITY_IAM",
         )
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(["aws-serverless-function.yaml"])
@@ -628,13 +693,20 @@ to create a managed default bucket, or run sam deploy --guided",
         # Package and Deploy in one go without confirming change set.
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
+        deploy_process_execute = self.run_command_with_input(
             deploy_command_list, "{}\n\n\n\n\n\n\n\n\n\n".format(stack_name).encode()
         )
 
         # Deploy should succeed with a managed stack
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        deploy_config_params = config.document["default"]["deploy"]["parameters"]
+        self.assertEqual(deploy_config_params["stack_name"], stack_name)
+        self.assertTrue(deploy_config_params["resolve_s3"])
+        self.assertEqual(deploy_config_params["region"], "us-east-1")
+        self.assertEqual(deploy_config_params["capabilities"], "CAPABILITY_IAM")
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -648,8 +720,8 @@ to create a managed default bucket, or run sam deploy --guided",
         # Package and Deploy in one go without confirming change set.
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
-            deploy_command_list, f"{stack_name}\n\n\n\n\ny\n\n\ny\n\n\n\n".encode()
+        deploy_process_execute = self.run_command_with_input(
+            deploy_command_list, f"{stack_name}\n\n\n\n\ny\n\n\n\n\n\n\n".encode()
         )
 
         # Deploy should succeed with a managed stack
@@ -659,6 +731,10 @@ to create a managed default bucket, or run sam deploy --guided",
         companion_stack_name = self._stack_name_to_companion_stack(stack_name)
         self._assert_companion_stack(self.cfn_client, companion_stack_name)
         self._assert_companion_stack_content(self.ecr_client, companion_stack_name)
+
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(config, stack_name=stack_name)
 
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
@@ -675,7 +751,7 @@ to create a managed default bucket, or run sam deploy --guided",
 
         autorization_question_answer = "\n" if does_ask_for_authorization else ""
 
-        deploy_process_execute = run_command_with_input(
+        deploy_process_execute = self.run_command_with_input(
             deploy_command_list,
             f"{stack_name}\n\n\n\n\ny\n\n\n{autorization_question_answer}n\n{self.ecr_repo_name}\n\n\n\n".encode(),
         )
@@ -691,6 +767,9 @@ to create a managed default bucket, or run sam deploy --guided",
             self.fail("Companion stack was created. This should not happen with specifying image repos.")
 
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(config, stack_name=stack_name)
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -704,13 +783,19 @@ to create a managed default bucket, or run sam deploy --guided",
         # Package and Deploy in one go without confirming change set.
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
-            deploy_command_list, "{}\n\nSuppliedParameter\n\n\n\n\n\n\n\n".format(stack_name).encode()
+        deploy_process_execute = self.run_command_with_input(
+            deploy_command_list,
+            "{}\n\nSuppliedParameter\n\n\n\n\n\n\n\n".format(stack_name).encode(),
         )
 
         # Deploy should succeed with a managed stack
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(
+            config, stack_name=stack_name, parameter_overrides='Parameter="SuppliedParameter"'
+        )
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -724,13 +809,21 @@ to create a managed default bucket, or run sam deploy --guided",
         # Package and Deploy in one go without confirming change set.
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
+        deploy_process_execute = self.run_command_with_input(
             deploy_command_list,
             "{}\n\nSuppliedParameter\n\nn\nCAPABILITY_IAM CAPABILITY_NAMED_IAM\n\n\n\n\n".format(stack_name).encode(),
         )
         # Deploy should succeed with a managed stack
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(
+            config,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM CAPABILITY_NAMED_IAM",
+            parameter_overrides='Parameter="SuppliedParameter"',
+        )
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -745,12 +838,18 @@ to create a managed default bucket, or run sam deploy --guided",
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
         # Set no for Allow SAM CLI IAM role creation, but allow default of ["CAPABILITY_IAM"] by just hitting the return key.
-        deploy_process_execute = run_command_with_input(
-            deploy_command_list, "{}\n\nSuppliedParameter\n\nn\n\n\n\n\n\n\n".format(stack_name).encode()
+        deploy_process_execute = self.run_command_with_input(
+            deploy_command_list,
+            "{}\n\nSuppliedParameter\n\nn\n\n\n\n\n\n\n".format(stack_name).encode(),
         )
         # Deploy should succeed with a managed stack
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(
+            config, stack_name=stack_name, parameter_overrides='Parameter="SuppliedParameter"'
+        )
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -764,13 +863,19 @@ to create a managed default bucket, or run sam deploy --guided",
         # Package and Deploy in one go without confirming change set.
         deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
-            deploy_command_list, "{}\n\nSuppliedParameter\nY\n\n\nY\n\n\n\n".format(stack_name).encode()
+        deploy_process_execute = self.run_command_with_input(
+            deploy_command_list,
+            "{}\n\nSuppliedParameter\nY\n\n\nY\n\n\n\n".format(stack_name).encode(),
         )
 
         # Deploy should succeed with a managed stack
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         self.stacks.append({"name": SAM_CLI_STACK_NAME})
+        # Verify the contents in samconfig
+        config = SamConfig(self.test_data_path)
+        self._assert_deploy_samconfig_parameters(
+            config, stack_name=stack_name, confirm_changeset=True, parameter_overrides='Parameter="SuppliedParameter"'
+        )
         # Remove samconfig.toml
         os.remove(self.test_data_path.joinpath(DEFAULT_CONFIG_FILE_NAME))
 
@@ -794,7 +899,7 @@ to create a managed default bucket, or run sam deploy --guided",
             s3_prefix=self.s3_prefix,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand([("aws-serverless-function.yaml", "samconfig-invalid-syntax.toml")])
@@ -802,11 +907,17 @@ to create a managed default bucket, or run sam deploy --guided",
         template_path = self.test_data_path.joinpath(template_file)
         config_path = self.test_data_path.joinpath(config_file)
 
-        deploy_command_list = self.get_deploy_command_list(template_file=template_path, config_file=config_path)
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path, s3_prefix=self.s3_prefix, config_file=config_path
+        )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
-        self.assertIn("Error reading configuration: Unexpected character", str(deploy_process_execute.stderr))
+        self.assertIn(
+            "Unexpected character: 'm' at line 2 col 11",
+            str(deploy_process_execute.stderr),
+            "Should notify user of the parsing error.",
+        )
 
     @parameterized.expand([("aws-serverless-function.yaml", "samconfig-tags-list.toml")])
     def test_deploy_with_valid_config_tags_list(self, template_file, config_file):
@@ -824,7 +935,7 @@ to create a managed default bucket, or run sam deploy --guided",
             capabilities="CAPABILITY_IAM",
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand([("aws-serverless-function.yaml", "samconfig-tags-string.toml")])
@@ -843,7 +954,7 @@ to create a managed default bucket, or run sam deploy --guided",
             capabilities="CAPABILITY_IAM",
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand([(True, True, True), (False, True, False), (False, False, True), (True, False, True)])
@@ -891,7 +1002,7 @@ to create a managed default bucket, or run sam deploy --guided",
             f"UntrustedArtifactOnDeployment={enforce_param}",
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
 
         if will_succeed:
             self.assertEqual(deploy_process_execute.process.returncode, 0)
@@ -905,24 +1016,28 @@ to create a managed default bucket, or run sam deploy --guided",
         ]
     )
     def test_deploy_sar_with_location_from_map(self, template_file, region, will_succeed):
-        template_path = Path(__file__).resolve().parents[1].joinpath("testdata", "buildcmd", template_file)
-        stack_name = self._method_to_stack_name(self.id())
-        self.stacks.append({"name": stack_name, "region": region})
+        with UpdatableSARTemplate(
+            Path(__file__).resolve().parents[1].joinpath("testdata", "buildcmd", template_file)
+        ) as sar_app:
+            template_path = sar_app.updated_template_path
+            stack_name = self._method_to_stack_name(self.id())
+            self.stacks.append({"name": stack_name, "region": region})
 
-        # The default region (us-east-1) has no entry in the map
-        deploy_command_list = self.get_deploy_command_list(
-            template_file=template_path,
-            stack_name=stack_name,
-            capabilities_list=["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"],
-            region=region,  # the !FindInMap has an entry for use-east-2 region only
-        )
-        deploy_process_execute = run_command(deploy_command_list)
+            # The default region (us-east-1) has no entry in the map
+            deploy_command_list = self.get_deploy_command_list(
+                template_file=template_path,
+                s3_prefix=self.s3_prefix,
+                stack_name=stack_name,
+                capabilities_list=["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"],
+                region=region,  # the !FindInMap has an entry for use-east-2 region only
+            )
+            deploy_process_execute = self.run_command(deploy_command_list)
 
-        if will_succeed:
-            self.assertEqual(deploy_process_execute.process.returncode, 0)
-        else:
-            self.assertEqual(deploy_process_execute.process.returncode, 1)
-            self.assertIn("Property \\'ApplicationId\\' cannot be resolved.", str(deploy_process_execute.stderr))
+            if will_succeed:
+                self.assertEqual(deploy_process_execute.process.returncode, 0)
+            else:
+                self.assertEqual(deploy_process_execute.process.returncode, 1)
+                self.assertIn("Property \\'ApplicationId\\' cannot be resolved.", str(deploy_process_execute.stderr))
 
     @parameterized.expand(
         [
@@ -931,22 +1046,26 @@ to create a managed default bucket, or run sam deploy --guided",
         ]
     )
     def test_deploy_guided_sar_with_location_from_map(self, template_file, region, will_succeed):
-        template_path = Path(__file__).resolve().parents[1].joinpath("testdata", "buildcmd", template_file)
-        stack_name = self._method_to_stack_name(self.id())
-        self.stacks.append({"name": stack_name, "region": region})
+        with UpdatableSARTemplate(
+            Path(__file__).resolve().parents[1].joinpath("testdata", "buildcmd", template_file)
+        ) as sar_app:
+            template_path = sar_app.updated_template_path
+            stack_name = self._method_to_stack_name(self.id())
+            self.stacks.append({"name": stack_name, "region": region})
 
-        # Package and Deploy in one go without confirming change set.
-        deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
+            # Package and Deploy in one go without confirming change set.
+            deploy_command_list = self.get_deploy_command_list(template_file=template_path, guided=True)
 
-        deploy_process_execute = run_command_with_input(
-            deploy_command_list, f"{stack_name}\n{region}\n\nN\nCAPABILITY_IAM CAPABILITY_AUTO_EXPAND\nn\nN\n".encode()
-        )
+            deploy_process_execute = self.run_command_with_input(
+                deploy_command_list,
+                f"{stack_name}\n{region}\n\nN\nCAPABILITY_IAM CAPABILITY_AUTO_EXPAND\nn\nN\n".encode(),
+            )
 
-        if will_succeed:
-            self.assertEqual(deploy_process_execute.process.returncode, 0)
-        else:
-            self.assertEqual(deploy_process_execute.process.returncode, 1)
-            self.assertIn("Property \\'ApplicationId\\' cannot be resolved.", str(deploy_process_execute.stderr))
+            if will_succeed:
+                self.assertEqual(deploy_process_execute.process.returncode, 0)
+            else:
+                self.assertEqual(deploy_process_execute.process.returncode, 1)
+                self.assertIn("Property \\'ApplicationId\\' cannot be resolved.", str(deploy_process_execute.stderr))
 
     @parameterized.expand(
         [os.path.join("deep-nested", "template.yaml"), os.path.join("deep-nested-image", "template.yaml")]
@@ -975,7 +1094,7 @@ to create a managed default bucket, or run sam deploy --guided",
             image_repository=self.ecr_repo_name,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         process_stdout = deploy_process_execute.stdout.decode()
         self.assertEqual(deploy_process_execute.process.returncode, 0)
         # verify child stack ChildStackX's creation
@@ -1008,7 +1127,7 @@ to create a managed default bucket, or run sam deploy --guided",
 
         prevdir = os.getcwd()
         os.chdir(os.path.expanduser(os.path.dirname(template_path)))
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         process_stdout = deploy_process_execute.stdout.decode()
         os.chdir(prevdir)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
@@ -1038,7 +1157,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
         stderr = deploy_process_execute.stderr.strip()
@@ -1076,7 +1195,7 @@ to create a managed default bucket, or run sam deploy --guided",
             disable_rollback=True,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
         stderr = deploy_process_execute.stderr.strip()
@@ -1109,7 +1228,7 @@ to create a managed default bucket, or run sam deploy --guided",
             disable_rollback=True,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(["aws-serverless-function.yaml"])
@@ -1136,7 +1255,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
         # Now update stack with failing template
@@ -1157,7 +1276,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
         stderr = deploy_process_execute.stderr.strip()
@@ -1195,7 +1314,7 @@ to create a managed default bucket, or run sam deploy --guided",
             confirm_changeset=False,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
         # Now update stack with failing template
@@ -1217,7 +1336,7 @@ to create a managed default bucket, or run sam deploy --guided",
             disable_rollback=True,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 1)
 
         stderr = deploy_process_execute.stderr.strip()
@@ -1250,7 +1369,7 @@ to create a managed default bucket, or run sam deploy --guided",
             disable_rollback=True,
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)
 
     @parameterized.expand(["aws-serverless-function-cdk.yaml", "cdk_v1_synthesized_template_zip_functions.json"])
@@ -1282,6 +1401,351 @@ to create a managed default bucket, or run sam deploy --guided",
             encoding="utf-8",
         )
 
-        deploy_process_execute = run_command(deploy_command_list)
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertIn(warning_message, deploy_process_execute.stdout)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+    @parameterized.expand(["aws-dynamodb-error.yaml"])
+    def test_deploy_on_failure_do_nothing_new_invalid_stack(self, template_file):
+        template_path = self.test_data_path.joinpath(template_file)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="ShardCountParameter=1",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            on_failure="DO_NOTHING",
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+
+        stderr = deploy_process_execute.stderr.strip()
+        self.assertIn(
+            bytes(
+                f"Error: Failed to create/update the stack: {stack_name}, Waiter StackCreateComplete failed: "
+                f'Waiter encountered a terminal failure state: For expression "Stacks[].StackStatus" '
+                f'we matched expected path: "ROLLBACK_COMPLETE" at least once',
+                encoding="utf-8",
+            ),
+            stderr,
+        )
+
+    @parameterized.expand(["aws-serverless-function.yaml"])
+    def test_deploy_on_failure_do_nothing_existing_stack(self, template_file):
+        template_path = self.test_data_path.joinpath(template_file)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # First deploy a simple template that should work
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+        # Failing template
+        template_path = self.test_data_path.joinpath("aws-dynamodb-error.yaml")
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="ShardCountParameter=1",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            on_failure="DO_NOTHING",
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+
+        stderr = deploy_process_execute.stderr.strip()
+        self.assertIn(
+            bytes(
+                f"Error: Failed to create/update the stack: {stack_name}, Waiter StackUpdateComplete failed: "
+                f'Waiter encountered a terminal failure state: For expression "Stacks[].StackStatus" '
+                f'we matched expected path: "UPDATE_ROLLBACK_COMPLETE" at least once',
+                encoding="utf-8",
+            ),
+            stderr,
+        )
+
+    @parameterized.expand(["aws-dynamodb-error.yaml"])
+    def test_deploy_on_failure_delete_new_stack(self, template_file):
+        template_path = self.test_data_path.joinpath(template_file)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="ShardCountParameter=1",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            on_failure="DELETE",
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+
+        # Check if the stack is deleted from CloudFormation
+        stack_exists = True
+        try:
+            self.cfn_client.describe_stacks(StackName=stack_name)
+        except botocore.exceptions.ClientError:
+            stack_exists = False
+
+        self.assertFalse(stack_exists)
+
+    @parameterized.expand(["aws-serverless-function.yaml"])
+    def test_deploy_on_failure_delete_existing_stack(self, template_file):
+        template_path = self.test_data_path.joinpath(template_file)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # First deploy a simple template that should work
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+        # Failing template
+        template_path = self.test_data_path.joinpath("aws-dynamodb-error.yaml")
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="ShardCountParameter=1",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            on_failure="DELETE",
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+
+        # Check if the stack rolled back successfully
+        result = self.cfn_client.describe_stacks(StackName=stack_name)
+        self.assertEqual(str(result["Stacks"][0]["StackStatus"]), "UPDATE_ROLLBACK_COMPLETE")
+
+    @parameterized.expand(["aws-dynamodb-error.yaml"])
+    def test_deploy_on_failure_delete_existing_stack_fails(self, template_file):
+        template_path = self.test_data_path.joinpath(template_file)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # Deploy bad stack with no rollback
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            disable_rollback=True,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+
+        # Failing template
+        template_path = self.test_data_path.joinpath(template_file)
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="ShardCountParameter=1",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+            on_failure="DELETE",
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 1)
+
+        # Check if the stack is deleted from CloudFormation
+        stack_exists = True
+        try:
+            self.cfn_client.describe_stacks(StackName=stack_name)
+        except botocore.exceptions.ClientError:
+            stack_exists = False
+
+        self.assertFalse(stack_exists)
+
+    @parameterized.expand(["aws-serverless-function.yaml"])
+    def test_update_stack_correct_stack_outputs(self, template):
+        template_path = self.test_data_path.joinpath(template)
+
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        # Deploy template that creates single resource
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+        # Deploy template that modifies existing resource, this should only UPDATE
+        template_path = self.test_data_path.joinpath("aws-serverless-function-cdk.yaml")
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            capabilities="CAPABILITY_IAM",
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+            image_repository=self.ecr_repo_name,
+            force_upload=True,
+            notification_arns=self.sns_arn,
+            parameter_overrides="Parameter=Clarity",
+            kms_key_id=self.kms_key,
+            no_execute_changeset=False,
+            tags="integ=true clarity=yes foo_bar=baz",
+            confirm_changeset=False,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+        # Check we don't have any instances of CREATE_COMPLETE since we are only updating
+        process_stdout = deploy_process_execute.stdout.decode()
+        self.assertNotRegex(process_stdout, r"CREATE_COMPLETE.+HelloWorldFunction")
+        self.assertRegex(process_stdout, r"UPDATE_COMPLETE.+HelloWorldFunction")
+
+    def test_deploy_with_language_extensions(self):
+        template = Path(__file__).resolve().parents[1].joinpath("testdata", "buildcmd", "language-extensions.yaml")
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template, stack_name=stack_name, s3_prefix=self.s3_prefix, capabilities="CAPABILITY_IAM"
+        )
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+    @parameterized.expand([("aws-serverless-function.yaml", "samconfig-capabilities-list.toml")])
+    def test_deploy_with_valid_config_capabilities_list(self, template_file, config_file):
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+        template_path = self.test_data_path.joinpath(template_file)
+        config_path = self.test_data_path.joinpath(config_file)
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            config_file=config_path,
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
+        self.assertEqual(deploy_process_execute.process.returncode, 0)
+
+    @parameterized.expand([("aws-serverless-function.yaml", "samconfig-capabilities-string.toml")])
+    def test_deploy_with_valid_config_capabilities_string(self, template_file, config_file):
+        stack_name = self._method_to_stack_name(self.id())
+        self.stacks.append({"name": stack_name})
+        template_path = self.test_data_path.joinpath(template_file)
+        config_path = self.test_data_path.joinpath(config_file)
+
+        deploy_command_list = self.get_deploy_command_list(
+            template_file=template_path,
+            stack_name=stack_name,
+            config_file=config_path,
+            s3_prefix=self.s3_prefix,
+            s3_bucket=self.s3_bucket.name,
+        )
+
+        deploy_process_execute = self.run_command(deploy_command_list)
         self.assertEqual(deploy_process_execute.process.returncode, 0)

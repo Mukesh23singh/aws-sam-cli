@@ -1,31 +1,53 @@
 """
 Reads CLI arguments and performs necessary preparation to be able to run the function
 """
+
 import errno
 import json
 import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, IO, cast, Tuple, Any, Type
+from typing import Any, Dict, List, Optional, TextIO, Tuple, Type, cast
 
-from samcli.lib.utils import osutils
-from samcli.lib.providers.provider import Stack, Function
-from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
-from samcli.lib.utils.async_utils import AsyncContext
-from samcli.lib.utils.stream_writer import StreamWriter
+from samcli.commands._utils.template import TemplateFailedParsingException, TemplateNotFoundException
 from samcli.commands.exceptions import ContainersInitializationException
-from samcli.commands.local.cli_common.user_exceptions import InvokeContextException, DebugContextException
-from samcli.commands.local.lib.local_lambda import LocalLambdaRunner
+from samcli.commands.local.cli_common.user_exceptions import DebugContextException, InvokeContextException
 from samcli.commands.local.lib.debug_context import DebugContext
-from samcli.local.lambdafn.runtime import LambdaRuntime, WarmLambdaRuntime
+from samcli.commands.local.lib.local_lambda import LocalLambdaRunner
+from samcli.lib.providers.provider import Function, Stack
+from samcli.lib.providers.sam_function_provider import RefreshableSamFunctionProvider, SamFunctionProvider
+from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
+from samcli.lib.utils import osutils
+from samcli.lib.utils.async_utils import AsyncContext
+from samcli.lib.utils.boto_utils import get_boto_client_provider_with_config
+from samcli.lib.utils.packagetype import ZIP
+from samcli.lib.utils.stream_writer import StreamWriter
+from samcli.local.docker.exceptions import PortAlreadyInUse
 from samcli.local.docker.lambda_image import LambdaImage
 from samcli.local.docker.manager import ContainerManager
-from samcli.commands._utils.template import TemplateNotFoundException, TemplateFailedParsingException
+from samcli.local.lambdafn.runtime import LambdaRuntime, WarmLambdaRuntime
 from samcli.local.layers.layer_downloader import LayerDownloader
-from samcli.lib.providers.sam_function_provider import SamFunctionProvider, RefreshableSamFunctionProvider
 
 LOG = logging.getLogger(__name__)
+
+
+class DockerIsNotReachableException(InvokeContextException):
+    """
+    Docker is not installed or not running at the moment
+    """
+
+
+class InvalidEnvironmentVariablesFileException(InvokeContextException):
+    """
+    User provided an environment variables file which couldn't be read by SAM CLI
+    """
+
+
+class NoFunctionIdentifierProvidedException(InvokeContextException):
+    """
+    If template has more than one function defined and user didn't provide any function logical id
+    """
 
 
 class ContainersInitializationMode(Enum):
@@ -77,6 +99,7 @@ class InvokeContext:
         shutdown: bool = False,
         container_host: Optional[str] = None,
         container_host_interface: Optional[str] = None,
+        add_host: Optional[dict] = None,
         invoke_images: Optional[str] = None,
     ) -> None:
         """
@@ -128,6 +151,8 @@ class InvokeContext:
             Optional. Host of locally emulated Lambda container
         container_host_interface string
             Optional. Interface that Docker host binds ports to
+        add_host dict
+            Optional. Docker extra hosts support from --add-host parameters
         invoke_images dict
             Optional. A dictionary that defines the custom invoke image URI of each function
         """
@@ -154,9 +179,13 @@ class InvokeContext:
         self._aws_region = aws_region
         self._aws_profile = aws_profile
         self._shutdown = shutdown
+        self._add_account_id_to_global()
 
         self._container_host = container_host
         self._container_host_interface = container_host_interface
+
+        self._extra_hosts: Optional[Dict] = add_host
+
         self._invoke_images = invoke_images
 
         self._containers_mode = ContainersMode.COLD
@@ -176,7 +205,7 @@ class InvokeContext:
         self._stacks: List[Stack] = None  # type: ignore
         self._env_vars_value: Optional[Dict] = None
         self._container_env_vars_value: Optional[Dict] = None
-        self._log_file_handle: Optional[IO] = None
+        self._log_file_handle: Optional[TextIO] = None
         self._debug_context: Optional[DebugContext] = None
         self._layers_downloader: Optional[LayerDownloader] = None
         self._container_manager: Optional[ContainerManager] = None
@@ -202,6 +231,11 @@ class InvokeContext:
             ContainersMode.WARM: [self._stacks, self._parameter_overrides, self._global_parameter_overrides],
             ContainersMode.COLD: [self._stacks],
         }
+
+        # don't resolve the code URI immediately if we passed in docker vol by passing True for use_raw_codeuri
+        # this way at the end the code URI will get resolved against the basedir option
+        if self._docker_volume_basedir:
+            _function_providers_args[self._containers_mode].append(True)
 
         self._function_provider = _function_providers_class[self._containers_mode](
             *_function_providers_args[self._containers_mode]
@@ -239,13 +273,22 @@ class InvokeContext:
         )
 
         if not self._container_manager.is_docker_reachable:
-            raise InvokeContextException(
+            raise DockerIsNotReachableException(
                 "Running AWS SAM projects locally requires Docker. Have you got it installed and running?"
             )
 
         # initialize all lambda function containers upfront
         if self._containers_initializing_mode == ContainersInitializationMode.EAGER:
             self._initialize_all_functions_containers()
+
+        for func in self._function_provider.get_all():
+            if func.packagetype == ZIP and func.inlinecode:
+                LOG.warning(
+                    "Warning: Inline code found for function %s."
+                    " Invocation of inline code is not supported for sam local commands.",
+                    func.function_id,
+                )
+                break
 
         return self
 
@@ -270,7 +313,12 @@ class InvokeContext:
         def initialize_function_container(function: Function) -> None:
             function_config = self.local_lambda_runner.get_invoke_config(function)
             self.lambda_runtime.run(
-                None, function_config, self._debug_context, self._container_host, self._container_host_interface
+                container=None,
+                function_config=function_config,
+                debug_context=self._debug_context,
+                container_host=self._container_host,
+                container_host_interface=self._container_host_interface,
+                extra_hosts=self._extra_hosts,
             )
 
         try:
@@ -284,6 +332,8 @@ class InvokeContext:
             LOG.debug("Ctrl+C was pressed. Aborting containers initialization")
             self._clean_running_containers_and_related_resources()
             raise
+        except PortAlreadyInUse as port_inuse_ex:
+            raise port_inuse_ex
         except Exception as ex:
             LOG.error("Lambda functions containers initialization failed because of %s", ex)
             self._clean_running_containers_and_related_resources()
@@ -296,6 +346,25 @@ class InvokeContext:
         """
         cast(WarmLambdaRuntime, self.lambda_runtime).clean_running_containers_and_related_resources()
         cast(RefreshableSamFunctionProvider, self._function_provider).stop_observer()
+
+    def _add_account_id_to_global(self) -> None:
+        """
+        Attempts to get the Account ID from the current session
+        If there is no current session, the standard parameter override for
+        AWS::AccountId is used
+        """
+        client_provider = get_boto_client_provider_with_config(region=self._aws_region, profile=self._aws_profile)
+
+        sts = client_provider("sts")
+
+        try:
+            account_id = sts.get_caller_identity().get("Account")
+            if account_id:
+                if self._global_parameter_overrides is None:
+                    self._global_parameter_overrides = {}
+                self._global_parameter_overrides["AWS::AccountId"] = account_id
+        except Exception:
+            LOG.warning("No current session found, using default AWS::AccountId")
 
     @property
     def function_identifier(self) -> str:
@@ -320,7 +389,7 @@ class InvokeContext:
         all_function_full_paths = [f.full_path for f in all_functions]
 
         # There are more functions in the template, and function identifier is not provided, hence raise.
-        raise InvokeContextException(
+        raise NoFunctionIdentifierProvidedException(
             "You must provide a function logical ID when there are more than one functions in your template. "
             "Possible options in your template: {}".format(all_function_full_paths)
         )
@@ -350,16 +419,20 @@ class InvokeContext:
         if self._local_lambda_runner:
             return self._local_lambda_runner
 
+        real_path = str(os.path.dirname(os.path.abspath(self._template_file)))
+
         self._local_lambda_runner = LocalLambdaRunner(
             local_runtime=self.lambda_runtime,
             function_provider=self._function_provider,
             cwd=self.get_cwd(),
+            real_path=real_path,
             aws_profile=self._aws_profile,
             aws_region=self._aws_region,
             env_vars_values=self._env_vars_value,
             debug_context=self._debug_context,
             container_host=self._container_host,
             container_host_interface=self._container_host_interface,
+            extra_hosts=self._extra_hosts,
         )
         return self._local_lambda_runner
 
@@ -427,7 +500,8 @@ class InvokeContext:
             )
             return stacks
         except (TemplateNotFoundException, TemplateFailedParsingException) as ex:
-            raise InvokeContextException(str(ex)) from ex
+            LOG.debug("Can't read stacks information, either template is not found or it is invalid", exc_info=ex)
+            raise ex
 
     @staticmethod
     def _get_env_vars_value(filename: Optional[str]) -> Optional[Dict]:
@@ -444,17 +518,16 @@ class InvokeContext:
 
         # Try to read the file and parse it as JSON
         try:
-
             with open(filename, "r") as fp:
                 return cast(Dict, json.load(fp))
 
         except Exception as ex:
-            raise InvokeContextException(
+            raise InvalidEnvironmentVariablesFileException(
                 "Could not read environment variables overrides from file {}: {}".format(filename, str(ex))
             ) from ex
 
     @staticmethod
-    def _setup_log_file(log_file: Optional[str]) -> Optional[IO]:
+    def _setup_log_file(log_file: Optional[str]) -> Optional[TextIO]:
         """
         Open a log file if necessary and return the file handle. This will create a file if it does not exist
 
@@ -464,7 +537,7 @@ class InvokeContext:
         if not log_file:
             return None
 
-        return open(log_file, "wb")
+        return open(log_file, "w", encoding="utf8")
 
     @staticmethod
     def _get_debug_context(

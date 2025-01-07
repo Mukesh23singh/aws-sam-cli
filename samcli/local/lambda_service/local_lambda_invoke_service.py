@@ -1,15 +1,18 @@
 """Local Lambda Service that only invokes a function"""
 
+import io
 import json
 import logging
-import io
 
 from flask import Flask, request
 from werkzeug.routing import BaseConverter
 
+from samcli.commands.local.lib.exceptions import UnsupportedInlineCodeError
 from samcli.lib.utils.stream_writer import StreamWriter
-from samcli.local.services.base_local_service import BaseLocalService, LambdaOutputParser
+from samcli.local.docker.exceptions import DockerContainerCreationFailedException
 from samcli.local.lambdafn.exceptions import FunctionNotFound
+from samcli.local.services.base_local_service import BaseLocalService, LambdaOutputParser
+
 from .lambda_error_responses import LambdaErrorResponses
 
 LOG = logging.getLogger(__name__)
@@ -17,6 +20,8 @@ LOG = logging.getLogger(__name__)
 
 class FunctionNamePathConverter(BaseConverter):
     regex = ".+"
+    weight = 300
+    part_isolating = False
 
     def to_python(self, value):
         return value
@@ -26,7 +31,7 @@ class FunctionNamePathConverter(BaseConverter):
 
 
 class LocalLambdaInvokeService(BaseLocalService):
-    def __init__(self, lambda_runner, port, host, stderr=None):
+    def __init__(self, lambda_runner, port, host, stderr=None, ssl_context=None):
         """
         Creates a Local Lambda Service that will only response to invoking a function
 
@@ -38,10 +43,13 @@ class LocalLambdaInvokeService(BaseLocalService):
             Optional. port for the service to start listening on
         host str
             Optional. host to start the service on
+        ssl_context : (str, str)
+            Optional. tuple(str, str) indicating the cert and key files to use to start in https mode
+            Defaults to None
         stderr io.BaseIO
             Optional stream where the stderr from Docker container should be written to
         """
-        super().__init__(lambda_runner.is_debugging(), port=port, host=host)
+        super().__init__(lambda_runner.is_debugging(), port=port, host=host, ssl_context=ssl_context)
         self.lambda_runner = lambda_runner
         self.stderr = stderr
 
@@ -158,22 +166,25 @@ class LocalLambdaInvokeService(BaseLocalService):
 
         request_data = request_data.decode("utf-8")
 
-        stdout_stream = io.BytesIO()
-        stdout_stream_writer = StreamWriter(stdout_stream, auto_flush=True)
+        stdout_stream_string = io.StringIO()
+        stdout_stream_bytes = io.BytesIO()
+        stdout_stream_writer = StreamWriter(stdout_stream_string, stdout_stream_bytes, auto_flush=True)
 
         try:
             self.lambda_runner.invoke(function_name, request_data, stdout=stdout_stream_writer, stderr=self.stderr)
         except FunctionNotFound:
             LOG.debug("%s was not found to invoke.", function_name)
             return LambdaErrorResponses.resource_not_found(function_name)
+        except UnsupportedInlineCodeError:
+            return LambdaErrorResponses.not_implemented_locally(
+                "Inline code is not supported for sam local commands. Please write your code in a separate file."
+            )
+        except DockerContainerCreationFailedException as ex:
+            return LambdaErrorResponses.container_creation_failed(ex.message)
 
-        lambda_response, lambda_logs, is_lambda_user_error_response = LambdaOutputParser.get_lambda_output(
-            stdout_stream
+        lambda_response, is_lambda_user_error_response = LambdaOutputParser.get_lambda_output(
+            stdout_stream_string, stdout_stream_bytes
         )
-
-        if self.stderr and lambda_logs:
-            # Write the logs to stderr if available.
-            self.stderr.write(lambda_logs)
 
         if is_lambda_user_error_response:
             return self.service_response(

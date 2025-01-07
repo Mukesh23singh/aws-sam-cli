@@ -12,12 +12,13 @@ from samcli.commands._utils.experimental import (
     prompt_experimental,
     set_experimental,
     get_enabled_experimental_flags,
+    get_all_experimental_env_vars,
 )
+from samcli.lib.utils.colors import Colored
 
 
 class TestExperimental(TestCase):
     def setUp(self):
-
         gc_patch = patch("samcli.commands._utils.experimental.GlobalConfig")
         self.gc_mock = gc_patch.start()
         self.addCleanup(gc_patch.stop)
@@ -60,6 +61,9 @@ class TestExperimental(TestCase):
 
     def test_get_all_experimental_statues(self):
         self.assertEqual(len(get_all_experimental_statues()), 4)
+
+    def test_get_all_experimental_env_vars(self):
+        self.assertEqual(len(get_all_experimental_env_vars()), 4)
 
     def test_get_enabled_experimental_flags(self):
         self.assertEqual(len(get_enabled_experimental_flags()), 4)
@@ -116,5 +120,5 @@ class TestExperimental(TestCase):
         prompt_experimental(config_entry, prompt)
         set_experimental_mock.assert_called_once_with(config_entry=config_entry, enabled=True)
         enabled_mock.assert_called_once_with(config_entry)
-        confirm_mock.assert_called_once_with(prompt, default=False)
+        confirm_mock.assert_called_once_with(Colored().yellow(prompt), default=False)
         update_experimental_context.assert_called_once()

@@ -52,7 +52,7 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_without_image_repository(self, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(template=template_path)
+        command_list = PackageIntegBase.get_command_list(template=template_path)
 
         process = Popen(command_list, stdout=PIPE, stderr=PIPE)
         try:
@@ -61,8 +61,9 @@ class TestPackageImage(PackageIntegBase):
             process.kill()
             raise
         process_stderr = stderr.strip()
-
-        self.assertIn("Error: Missing option '--image-repository'", process_stderr.decode("utf-8"))
+        self.assertIn(
+            "Error: Missing option '--image-repositories', '--image-repository'", process_stderr.decode("utf-8")
+        )
         self.assertEqual(2, process.returncode)
 
     @parameterized.expand(
@@ -75,7 +76,7 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_with_image_repository(self, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(image_repository=self.ecr_repo_name, template=template_path)
+        command_list = PackageIntegBase.get_command_list(image_repository=self.ecr_repo_name, template=template_path)
 
         process = Popen(command_list, stdout=PIPE)
         try:
@@ -98,7 +99,7 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_with_image_repositories(self, resource_id, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(
+        command_list = PackageIntegBase.get_command_list(
             image_repositories=f"{resource_id}={self.ecr_repo_name}", template=template_path
         )
 
@@ -128,7 +129,7 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_with_image_repositories_nested_stack(self, resource_id, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(
+        command_list = PackageIntegBase.get_command_list(
             image_repositories=f"{resource_id}={self.ecr_repo_name}", template=template_path, resolve_s3=True
         )
 
@@ -138,8 +139,8 @@ class TestPackageImage(PackageIntegBase):
         except TimeoutExpired:
             process.kill()
             raise
-
         process_stderr = stderr.strip()
+
         self.assertIn(f"{self.ecr_repo_name}", process_stderr.decode("utf-8"))
         self.assertEqual(0, process.returncode)
 
@@ -152,7 +153,7 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_with_non_ecr_repo_uri_image_repository(self, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(
+        command_list = PackageIntegBase.get_command_list(
             image_repository="non-ecr-repo-uri", template=template_path, resolve_s3=True
         )
 
@@ -176,7 +177,9 @@ class TestPackageImage(PackageIntegBase):
     )
     def test_package_template_and_s3_bucket(self, template_file):
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(s3_bucket=self.s3_bucket, s3_prefix=self.s3_prefix, template=template_path)
+        command_list = PackageIntegBase.get_command_list(
+            s3_bucket=self.s3_bucket, s3_prefix=self.s3_prefix, template=template_path
+        )
 
         process = Popen(command_list, stdout=PIPE, stderr=PIPE)
         try:
@@ -187,7 +190,9 @@ class TestPackageImage(PackageIntegBase):
         process_stderr = stderr.strip()
 
         self.assertEqual(2, process.returncode)
-        self.assertIn("Error: Missing option '--image-repository'", process_stderr.decode("utf-8"))
+        self.assertIn(
+            "Error: Missing option '--image-repositories', '--image-repository'", process_stderr.decode("utf-8")
+        )
 
     @parameterized.expand(["aws-serverless-application-image.yaml"])
     def test_package_template_with_image_function_in_nested_application(self, template_file):
@@ -200,7 +205,7 @@ class TestPackageImage(PackageIntegBase):
             # Closes the NamedTemporaryFile as on Windows NT or later, NamedTemporaryFile cannot be opened twice.
             packaged_file.close()
 
-            command_list = self.get_command_list(
+            command_list = PackageIntegBase.get_command_list(
                 image_repository=self.ecr_repo_name,
                 template=template_path,
                 resolve_s3=True,
@@ -245,7 +250,7 @@ class TestPackageImage(PackageIntegBase):
         template_file = os.path.join("deep-nested-image", "template.yaml")
 
         template_path = self.test_data_path.joinpath(template_file)
-        command_list = self.get_command_list(
+        command_list = PackageIntegBase.get_command_list(
             image_repository=self.ecr_repo_name, resolve_s3=True, template=template_path, force_upload=True
         )
 
@@ -265,4 +270,36 @@ class TestPackageImage(PackageIntegBase):
         for image, tag in images:
             # check string like this:
             # ...python-ce689abb4f0d-3.9-slim: digest:...
-            self.assertRegex(process_stderr, fr"{image}-.+-{tag}: digest:")
+            self.assertRegex(process_stderr, rf"{image}-.+-{tag}: digest:")
+
+    @parameterized.expand(["template-image-load.yaml"])
+    def test_package_with_loadable_image_archive(self, template_file):
+        template_path = self.test_data_path.joinpath(os.path.join("load-image-archive", template_file))
+        command_list = PackageIntegBase.get_command_list(image_repository=self.ecr_repo_name, template=template_path)
+
+        process = Popen(command_list, stderr=PIPE)
+        try:
+            _, stderr = process.communicate(timeout=TIMEOUT)
+        except TimeoutExpired:
+            process.kill()
+            raise
+        process_stderr = stderr.strip()
+
+        self.assertEqual(0, process.returncode)
+        self.assertIn(f"{self.ecr_repo_name}", process_stderr.decode("utf-8"))
+
+    @parameterized.expand(["template-image-load-fail.yaml"])
+    def test_package_with_nonloadable_image_archive(self, template_file):
+        template_path = self.test_data_path.joinpath(os.path.join("load-image-archive", template_file))
+        command_list = PackageIntegBase.get_command_list(image_repository=self.ecr_repo_name, template=template_path)
+
+        process = Popen(command_list, stderr=PIPE)
+        try:
+            _, stderr = process.communicate(timeout=TIMEOUT)
+        except TimeoutExpired:
+            process.kill()
+            raise
+        process_stderr = stderr.strip()
+
+        self.assertEqual(1, process.returncode)
+        self.assertIn("unexpected EOF", process_stderr.decode("utf-8"))

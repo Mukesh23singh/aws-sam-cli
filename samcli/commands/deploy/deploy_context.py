@@ -25,11 +25,12 @@ import click
 from samcli.commands.deploy import exceptions as deploy_exceptions
 from samcli.commands.deploy.auth_utils import auth_per_resource
 from samcli.commands.deploy.utils import (
-    sanitize_parameter_overrides,
-    print_deploy_args,
     hide_noecho_parameter_overrides,
+    print_deploy_args,
+    sanitize_parameter_overrides,
 )
 from samcli.lib.deploy.deployer import Deployer
+from samcli.lib.deploy.utils import FailureMode
 from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
@@ -40,7 +41,6 @@ LOG = logging.getLogger(__name__)
 
 
 class DeployContext:
-
     MSG_SHOWCASE_CHANGESET = "\nChangeset created successfully. {changeset_id}\n"
 
     MSG_EXECUTE_SUCCESS = "\nSuccessfully created/updated stack - {stack_name} in {region}\n"
@@ -72,6 +72,9 @@ class DeployContext:
         signing_profiles,
         use_changeset,
         disable_rollback,
+        poll_delay,
+        on_failure,
+        max_wait_duration,
     ):
         self.template_file = template_file
         self.stack_name = stack_name
@@ -101,6 +104,10 @@ class DeployContext:
         self.signing_profiles = signing_profiles
         self.use_changeset = use_changeset
         self.disable_rollback = disable_rollback
+        self.poll_delay = poll_delay
+        self.on_failure = FailureMode(on_failure) if on_failure else FailureMode.ROLLBACK
+        self._max_template_size = 51200
+        self.max_wait_duration = max_wait_duration
 
     def __enter__(self):
         return self
@@ -127,7 +134,7 @@ class DeployContext:
         parameters = self.merge_parameters(template_dict, self.parameter_overrides)
 
         template_size = os.path.getsize(self.template_file)
-        if template_size > 51200 and not self.s3_bucket:
+        if template_size > self._max_template_size and not self.s3_bucket:
             raise deploy_exceptions.DeployBucketRequiredError()
         boto_config = get_boto_config_with_user_agent()
         cloudformation_client = boto3.client(
@@ -142,7 +149,7 @@ class DeployContext:
                 s3_client, self.s3_bucket, self.s3_prefix, self.kms_key_id, self.force_upload, self.no_progressbar
             )
 
-        self.deployer = Deployer(cloudformation_client)
+        self.deployer = Deployer(cloudformation_client, client_sleep=self.poll_delay)
 
         region = s3_client._client_config.region_name if s3_client else self.region  # pylint: disable=W0212
         display_parameter_overrides = hide_noecho_parameter_overrides(template_dict, self.parameter_overrides)
@@ -177,20 +184,20 @@ class DeployContext:
 
     def deploy(
         self,
-        stack_name,
-        template_str,
-        parameters,
-        capabilities,
-        no_execute_changeset,
-        role_arn,
-        notification_arns,
-        s3_uploader,
-        tags,
-        region,
-        fail_on_empty_changeset=True,
-        confirm_changeset=False,
-        use_changeset=True,
-        disable_rollback=False,
+        stack_name: str,
+        template_str: str,
+        parameters: List[dict],
+        capabilities: List[str],
+        no_execute_changeset: bool,
+        role_arn: str,
+        notification_arns: List[str],
+        s3_uploader: S3Uploader,
+        tags: List[str],
+        region: str,
+        fail_on_empty_changeset: bool = True,
+        confirm_changeset: bool = False,
+        use_changeset: bool = True,
+        disable_rollback: bool = False,
     ):
         """
         Deploy the stack to cloudformation.
@@ -237,7 +244,7 @@ class DeployContext:
 
         for resource, authorization_required in auth_required_per_resource:
             if not authorization_required:
-                click.secho(f"{resource} may not have authorization defined.", fg="yellow")
+                click.secho(f"{resource} has no authentication.", fg="yellow")
 
         if use_changeset:
             try:
@@ -262,14 +269,22 @@ class DeployContext:
                     if not click.confirm(f"{self.MSG_CONFIRM_CHANGESET}", default=False):
                         return
 
+                marker_time = self.deployer.get_last_event_time(stack_name, 0)
                 self.deployer.execute_changeset(result["Id"], stack_name, disable_rollback)
-                self.deployer.wait_for_execute(stack_name, changeset_type, disable_rollback)
+                self.deployer.wait_for_execute(
+                    stack_name, changeset_type, disable_rollback, self.on_failure, marker_time, self.max_wait_duration
+                )
                 click.echo(self.MSG_EXECUTE_SUCCESS.format(stack_name=stack_name, region=region))
 
             except deploy_exceptions.ChangeEmptyError as ex:
                 if fail_on_empty_changeset:
                     raise
                 click.echo(str(ex))
+            except deploy_exceptions.DeployFailedError:
+                # Failed to deploy, check for DELETE action otherwise skip
+                if self.on_failure == FailureMode.DELETE:
+                    self.deployer.rollback_delete_stack(stack_name)
+                raise
 
         else:
             try:
@@ -282,8 +297,9 @@ class DeployContext:
                     notification_arns=notification_arns,
                     s3_uploader=s3_uploader,
                     tags=tags,
+                    on_failure=self.on_failure,
                 )
-                LOG.info(result)
+                LOG.debug(result)
 
             except deploy_exceptions.DeployFailedError as ex:
                 LOG.error(str(ex))
@@ -308,7 +324,6 @@ class DeployContext:
             return parameter_values
 
         for key, _ in template_dict["Parameters"].items():
-
             obj = {"ParameterKey": key}
 
             if key in parameter_overrides:

@@ -1,15 +1,18 @@
+import json
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack
 from unittest import TestCase
-from unittest.mock import patch, call, MagicMock
+from unittest.mock import patch, call, MagicMock, Mock
 
 import click
+from botocore.exceptions import NoCredentialsError, NoRegionError
 
 from samcli.commands.delete.delete_context import DeleteContext
 from samcli.lib.package.artifact_exporter import Template
-from samcli.cli.cli_config_file import TomlProvider
+from samcli.cli.cli_config_file import ConfigProvider
 from samcli.lib.delete.cfn_utils import CfnUtils
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.package.ecr_uploader import ECRUploader
+from samcli.commands.exceptions import AWSServiceClientError, RegionError
 
 from samcli.commands.delete.exceptions import CfDeleteFailedStatusError
 
@@ -17,39 +20,40 @@ from samcli.commands.delete.exceptions import CfDeleteFailedStatusError
 class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.click.echo")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(return_value=(False)))
-    def test_delete_context_stack_does_not_exist(self, patched_click_get_current_context, patched_click_echo):
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(return_value=(False)))
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_delete_context_stack_does_not_exist(
+        self, get_boto_client_provider_mock, patched_click_get_current_context, patched_click_echo
+    ):
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=True,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
-
             delete_context.run()
             expected_click_echo_calls = [
                 call(f"Error: The input stack test does" + f" not exist on Cloudformation in the region us-east-1"),
             ]
             self.assertEqual(expected_click_echo_calls, patched_click_echo.call_args_list)
 
-    @patch.object(DeleteContext, "parse_config_file", MagicMock())
     @patch.object(DeleteContext, "init_clients", MagicMock())
-    def test_delete_context_enter(self):
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_delete_context_enter(self, get_boto_client_provider_mock):
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=True,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
-            self.assertEqual(delete_context.parse_config_file.call_count, 1)
             self.assertEqual(delete_context.init_clients.call_count, 1)
 
     @patch.object(
-        TomlProvider,
+        ConfigProvider,
         "__call__",
         MagicMock(
             return_value=(
@@ -63,36 +67,22 @@ class TestDeleteContext(TestCase):
             )
         ),
     )
-    @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    def test_delete_context_parse_config_file(self, patched_click_get_current_context):
-        patched_click_get_current_context = MagicMock()
-        with DeleteContext(
-            stack_name=None,
-            region=None,
-            config_file="samconfig.toml",
-            config_env="default",
-            profile=None,
-            no_prompts=True,
-        ) as delete_context:
-            self.assertEqual(delete_context.stack_name, "test")
-            self.assertEqual(delete_context.region, "us-east-1")
-            self.assertEqual(delete_context.profile, "developer")
-            self.assertEqual(delete_context.s3_bucket, "s3-bucket")
-            self.assertEqual(delete_context.s3_prefix, "s3-prefix")
-
     @patch("samcli.commands.delete.delete_context.prompt")
     @patch("samcli.commands.delete.delete_context.confirm")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(return_value=(False)))
-    def test_delete_no_user_input(self, patched_click_get_current_context, patched_confirm, patched_prompt):
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(return_value=(False)))
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_delete_no_user_input(
+        self, get_boto_client_provider_mock, patched_click_get_current_context, patched_confirm, patched_prompt
+    ):
         patched_click_get_current_context = MagicMock()
         with DeleteContext(
             stack_name=None,
             region=None,
-            config_file=None,
-            config_env=None,
             profile=None,
             no_prompts=None,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             delete_context.run()
 
@@ -106,7 +96,7 @@ class TestDeleteContext(TestCase):
         self.assertEqual(expected_prompt_calls, patched_prompt.call_args_list)
 
     @patch.object(
-        TomlProvider,
+        ConfigProvider,
         "__call__",
         MagicMock(
             return_value=(
@@ -120,26 +110,27 @@ class TestDeleteContext(TestCase):
             )
         ),
     )
-    @patch.object(CfnUtils, "has_stack", MagicMock(return_value=(True)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(return_value=(True)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
     @patch.object(Template, "get_ecr_repos", MagicMock(return_value=({"logical_id": {"Repository": "test_id"}})))
     @patch.object(S3Uploader, "delete_prefix_artifacts", MagicMock())
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    def test_delete_context_valid_execute_run(self, patched_click_get_current_context):
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_delete_context_valid_execute_run(self, get_boto_client_provider_mock, patched_click_get_current_context):
         patched_click_get_current_context = MagicMock()
         with DeleteContext(
-            stack_name=None,
+            stack_name="test",
             region=None,
-            config_file="samconfig.toml",
-            config_env="default",
             profile=None,
             no_prompts=True,
+            s3_bucket="test",
+            s3_prefix="test",
         ) as delete_context:
             delete_context.run()
 
-            self.assertEqual(CfnUtils.has_stack.call_count, 2)
+            self.assertEqual(CfnUtils.can_delete_stack.call_count, 2)
             self.assertEqual(CfnUtils.get_stack_template.call_count, 2)
             self.assertEqual(CfnUtils.delete_stack.call_count, 2)
             self.assertEqual(CfnUtils.wait_for_delete.call_count, 2)
@@ -149,27 +140,29 @@ class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.click.echo")
     @patch("samcli.commands.deploy.guided_context.click.secho")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, False)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, False)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
     def test_delete_context_no_s3_bucket(
-        self, patched_click_get_current_context, patched_click_secho, patched_click_echo
+        self, get_boto_client_provider_mock, patched_click_get_current_context, patched_click_secho, patched_click_echo
     ):
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=True,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
-
             delete_context.run()
             expected_click_secho_calls = [
                 call(
-                    "\nWarning: s3_bucket and s3_prefix information could not be obtained from local config file"
-                    " or cloudformation template, delete the s3 files manually if required",
+                    "\nWarning: Cannot resolve s3 bucket information from command options"
+                    " , local config file or cloudformation template. Please use"
+                    " --s3-bucket next time and"
+                    " delete s3 files manually if required.",
                     fg="yellow",
                 ),
             ]
@@ -184,23 +177,27 @@ class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.get_uploaded_s3_object_name")
     @patch("samcli.commands.delete.delete_context.confirm")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, False)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, False)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
     @patch.object(S3Uploader, "delete_artifact", MagicMock())
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
     def test_guided_prompts_s3_bucket_prefix_present_execute_run(
-        self, patched_click_get_current_context, patched_confirm, patched_get_cf_template_name
+        self,
+        get_boto_client_provider_mock,
+        patched_click_get_current_context,
+        patched_confirm,
+        patched_get_cf_template_name,
     ):
-
         patched_get_cf_template_name.return_value = "hello.template"
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=None,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             patched_confirm.side_effect = [True, False, True]
             delete_context.s3_bucket = "s3_bucket"
@@ -240,24 +237,28 @@ class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.get_uploaded_s3_object_name")
     @patch("samcli.commands.delete.delete_context.confirm")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, False)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, False)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
     @patch.object(S3Uploader, "delete_artifact", MagicMock())
     @patch.object(ECRUploader, "delete_ecr_repository", MagicMock())
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
     def test_guided_prompts_s3_bucket_present_no_prefix_execute_run(
-        self, patched_click_get_current_context, patched_confirm, patched_get_cf_template_name
+        self,
+        get_boto_client_provider_mock,
+        patched_click_get_current_context,
+        patched_confirm,
+        patched_get_cf_template_name,
     ):
-
         patched_get_cf_template_name.return_value = "hello.template"
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=None,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             patched_confirm.side_effect = [True, True]
             delete_context.s3_bucket = "s3_bucket"
@@ -287,26 +288,30 @@ class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.get_uploaded_s3_object_name")
     @patch("samcli.commands.delete.delete_context.confirm")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, True)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, True)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
     @patch.object(S3Uploader, "delete_artifact", MagicMock())
     @patch.object(ECRUploader, "delete_ecr_repository", MagicMock())
     @patch.object(Template, "get_ecr_repos", MagicMock(side_effect=({}, {"logical_id": {"Repository": "test_id"}})))
     @patch.object(CompanionStack, "stack_name", "Companion-Stack-Name")
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
     def test_guided_prompts_ecr_companion_stack_present_execute_run(
-        self, patched_click_get_current_context, patched_confirm, patched_get_cf_template_name
+        self,
+        get_boto_client_provider_mock,
+        patched_click_get_current_context,
+        patched_confirm,
+        patched_get_cf_template_name,
     ):
-
         patched_get_cf_template_name.return_value = "hello.template"
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=None,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             patched_confirm.side_effect = [True, False, True, True, True]
             delete_context.s3_bucket = "s3_bucket"
@@ -339,7 +344,7 @@ class TestDeleteContext(TestCase):
                 ),
                 call(
                     click.style(
-                        "\tDo you you want to delete the ECR companion stack"
+                        "\tDo you want to delete the ECR companion stack"
                         + " Companion-Stack-Name in the region us-east-1 ?",
                         bold=True,
                     ),
@@ -362,28 +367,33 @@ class TestDeleteContext(TestCase):
     @patch("samcli.commands.delete.delete_context.get_uploaded_s3_object_name")
     @patch("samcli.commands.delete.delete_context.click.echo")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, False)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, False)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(CfnUtils, "wait_for_delete", MagicMock())
     @patch.object(S3Uploader, "delete_prefix_artifacts", MagicMock())
     @patch.object(ECRUploader, "delete_ecr_repository", MagicMock())
     @patch.object(Template, "get_ecr_repos", MagicMock(return_value=({"logical_id": {"Repository": "test_id"}})))
     @patch.object(CompanionStack, "stack_name", "Companion-Stack-Name")
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
     def test_no_prompts_input_is_ecr_companion_stack_present_execute_run(
-        self, patched_click_get_current_context, patched_click_echo, patched_get_cf_template_name
+        self,
+        get_boto_client_provider_mock,
+        patched_click_get_current_context,
+        patched_click_echo,
+        patched_get_cf_template_name,
     ):
-        CfnUtils.get_stack_template.return_value = {
-            "TemplateBody": {"Metadata": {"CompanionStackname": "Companion-Stack-Name"}}
-        }
+        CfnUtils.get_stack_template.return_value = json.dumps(
+            {"Metadata": {"CompanionStackname": "Companion-Stack-Name"}}
+        )
         patched_get_cf_template_name.return_value = "hello.template"
         with DeleteContext(
             stack_name="Companion-Stack-Name",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=True,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             delete_context.s3_bucket = "s3_bucket"
             delete_context.s3_prefix = "s3_prefix"
@@ -397,8 +407,8 @@ class TestDeleteContext(TestCase):
 
     @patch("samcli.commands.delete.delete_context.get_uploaded_s3_object_name")
     @patch("samcli.commands.delete.delete_context.click.get_current_context")
-    @patch.object(CfnUtils, "has_stack", MagicMock(side_effect=(True, True)))
-    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value=({"TemplateBody": "Hello World"})))
+    @patch.object(CfnUtils, "can_delete_stack", MagicMock(side_effect=(True, True)))
+    @patch.object(CfnUtils, "get_stack_template", MagicMock(return_value="Hello World"))
     @patch.object(CfnUtils, "delete_stack", MagicMock())
     @patch.object(
         CfnUtils,
@@ -415,22 +425,105 @@ class TestDeleteContext(TestCase):
     @patch.object(S3Uploader, "delete_prefix_artifacts", MagicMock())
     @patch.object(ECRUploader, "delete_ecr_repository", MagicMock())
     @patch.object(Template, "get_ecr_repos", MagicMock(side_effect=({}, {"logical_id": {"Repository": "test_id"}})))
-    def test_retain_resources_delete_stack(self, patched_click_get_current_context, patched_get_cf_template_name):
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_retain_resources_delete_stack(
+        self, get_boto_client_provider_mock, patched_click_get_current_context, patched_get_cf_template_name
+    ):
         patched_get_cf_template_name.return_value = "hello.template"
         with DeleteContext(
             stack_name="test",
             region="us-east-1",
-            config_file="samconfig.toml",
-            config_env="default",
             profile="test",
             no_prompts=True,
+            s3_bucket=None,
+            s3_prefix=None,
         ) as delete_context:
             delete_context.s3_bucket = "s3_bucket"
             delete_context.s3_prefix = "s3_prefix"
 
             delete_context.run()
 
-            self.assertEqual(CfnUtils.has_stack.call_count, 2)
+            self.assertEqual(CfnUtils.can_delete_stack.call_count, 2)
             self.assertEqual(CfnUtils.get_stack_template.call_count, 2)
             self.assertEqual(CfnUtils.delete_stack.call_count, 4)
             self.assertEqual(CfnUtils.wait_for_delete.call_count, 4)
+
+    @patch.object(DeleteContext, "init_clients", MagicMock())
+    def test_s3_option_flag(self):
+        with DeleteContext(
+            stack_name="test",
+            region="us-east-1",
+            profile="test",
+            no_prompts=True,
+            s3_bucket="s3_bucket",
+            s3_prefix="s3_prefix",
+        ) as delete_context:
+            self.assertEqual(delete_context.s3_bucket, "s3_bucket")
+            self.assertEqual(delete_context.s3_prefix, "s3_prefix")
+
+    @patch.object(
+        ConfigProvider,
+        "__call__",
+        MagicMock(
+            return_value=(
+                {
+                    "stack_name": "test",
+                    "region": "us-east-1",
+                    "profile": "developer",
+                    "s3_bucket": "s3_bucket",
+                    "s3_prefix": "s3_prefix",
+                }
+            )
+        ),
+    )
+    @patch.object(DeleteContext, "init_clients", MagicMock())
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_s3_option_flag_overrides_config(self, get_boto_client_provider_mock):
+        with DeleteContext(
+            stack_name="test",
+            region="us-east-1",
+            profile="test",
+            no_prompts=True,
+            s3_bucket="s3_bucket_override",
+            s3_prefix="s3_prefix_override",
+        ) as delete_context:
+            self.assertEqual(delete_context.s3_bucket, "s3_bucket_override")
+            self.assertEqual(delete_context.s3_prefix, "s3_prefix_override")
+
+    @patch("samcli.commands.delete.delete_context.click.get_current_context")
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_must_throw_error_if_boto3_cannot_resolve_credentials(
+        self, get_boto_client_provider_mock, patched_get_current_context
+    ):
+        boto_client_mock = Mock(side_effect=NoCredentialsError)
+        get_boto_client_provider_mock.return_value = boto_client_mock
+        with self.assertRaises(AWSServiceClientError) as ex:
+            with DeleteContext(
+                stack_name="test",
+                region=None,
+                profile="profile_without_creds",
+                no_prompts=True,
+                s3_bucket=None,
+                s3_prefix=None,
+            ):
+                get_boto_client_provider_mock.assert_called_once_with(region=None, profile="profile_without_creds")
+                self.assertIn("Unable to resolve credentials for the AWS SDK for Python client", ex)
+
+    @patch("samcli.commands.delete.delete_context.click.get_current_context")
+    @patch("samcli.commands.delete.delete_context.get_boto_client_provider_with_config")
+    def test_must_throw_error_if_boto3_cannot_resolve_region(
+        self, get_boto_client_provider_mock, patched_get_current_context
+    ):
+        boto_client_mock = Mock(side_effect=NoRegionError)
+        get_boto_client_provider_mock.return_value = boto_client_mock
+        with self.assertRaises(RegionError) as ex:
+            with DeleteContext(
+                stack_name="test",
+                region=None,
+                profile="profile_without_region",
+                no_prompts=True,
+                s3_bucket=None,
+                s3_prefix=None,
+            ):
+                get_boto_client_provider_mock.assert_called_once_with(region=None, profile="profile_without_region")
+                self.assertIn("Unable to resolve a region", ex)

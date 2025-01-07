@@ -1,45 +1,51 @@
 """
 Context object used by build command
 """
+
 import logging
 import os
 import pathlib
 import shutil
-from typing import Dict, Optional, List, cast
+from typing import Dict, List, Optional, Tuple
 
 import click
 
-from samcli.commands._utils.experimental import is_experimental_enabled, ExperimentalFlag, prompt_experimental
-from samcli.lib.providers.sam_api_provider import SamApiProvider
-from samcli.lib.utils.packagetype import IMAGE
-
-from samcli.commands._utils.template import get_template_data
+from samcli.commands._utils.constants import DEFAULT_BUILD_DIR
+from samcli.commands._utils.experimental import ExperimentalFlag, prompt_experimental
+from samcli.commands._utils.template import (
+    get_template_data,
+    move_template,
+)
 from samcli.commands.build.exceptions import InvalidBuildDirException, MissingBuildMethodException
+from samcli.commands.build.utils import MountMode, prompt_user_to_enable_mount_with_write_if_needed
+from samcli.commands.exceptions import UserException
 from samcli.lib.bootstrap.nested_stack.nested_stack_manager import NestedStackManager
+from samcli.lib.build.app_builder import (
+    ApplicationBuilder,
+    ApplicationBuildResult,
+    BuildError,
+    UnsupportedBuilderLibraryVersionError,
+)
 from samcli.lib.build.build_graph import DEFAULT_DEPENDENCIES_DIR
+from samcli.lib.build.bundler import EsbuildBundlerManager
+from samcli.lib.build.exceptions import (
+    BuildInsideContainerError,
+    InvalidBuildGraphException,
+)
+from samcli.lib.build.workflow_config import UnsupportedRuntimeException
 from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
-from samcli.lib.providers.provider import ResourcesToBuildCollector, Stack, Function, LayerVersion
+from samcli.lib.providers.provider import LayerVersion, ResourcesToBuildCollector, Stack
+from samcli.lib.providers.sam_api_provider import SamApiProvider
 from samcli.lib.providers.sam_function_provider import SamFunctionProvider
 from samcli.lib.providers.sam_layer_provider import SamLayerProvider
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
+from samcli.lib.telemetry.event import EventName, EventTracker, UsedFeature
 from samcli.lib.utils.osutils import BUILD_DIR_PERMISSIONS
 from samcli.local.docker.manager import ContainerManager
-from samcli.local.lambdafn.exceptions import ResourceNotFound
-from samcli.lib.build.exceptions import BuildInsideContainerError
-
-from samcli.commands.exceptions import UserException
-
-from samcli.lib.build.app_builder import (
-    ApplicationBuilder,
-    BuildError,
-    UnsupportedBuilderLibraryVersionError,
-    ContainerBuildNotSupported,
+from samcli.local.lambdafn.exceptions import (
+    FunctionNotFound,
+    ResourceNotFound,
 )
-from samcli.commands._utils.options import DEFAULT_BUILD_DIR
-from samcli.lib.build.workflow_config import UnsupportedRuntimeException
-from samcli.local.lambdafn.exceptions import FunctionNotFound
-from samcli.commands._utils.template import move_template
-from samcli.lib.build.exceptions import InvalidBuildGraphException
 
 LOG = logging.getLogger(__name__)
 
@@ -67,11 +73,73 @@ class BuildContext:
         container_env_var: Optional[dict] = None,
         container_env_var_file: Optional[str] = None,
         build_images: Optional[dict] = None,
+        excluded_resources: Optional[Tuple[str, ...]] = None,
         aws_region: Optional[str] = None,
         create_auto_dependency_layer: bool = False,
         stack_name: Optional[str] = None,
         print_success_message: bool = True,
+        locate_layer_nested: bool = False,
+        hook_name: Optional[str] = None,
+        build_in_source: Optional[bool] = None,
+        mount_with: str = MountMode.READ.value,
     ) -> None:
+        """
+        Initialize the class
+
+        Parameters
+        ----------
+        resource_identifier: Optional[str]
+            The unique identifier of the resource
+        template_file: str
+            Path to the template for building
+        base_dir : str
+            Path to a folder. Use this folder as the root to resolve relative source code paths against
+        build_dir : str
+            Path to the directory where we will be storing built artifacts
+        cache_dir : str
+            Path to a the directory where we will be caching built artifacts
+        cached:
+            Optional. Set to True to build each function with cache to improve performance
+        parallel : bool
+            Optional. Set to True to build each function in parallel to improve performance
+        mode : str
+            Optional, name of the build mode to use ex: 'debug'
+        manifest_path : Optional[str]
+            Optional path to manifest file to replace the default one
+        clean: bool
+            Clear the build directory before building
+        use_container: bool
+            Build inside container
+        parameter_overrides: Optional[dict]
+            Optional dictionary of values for SAM template parameters that might want
+            to get substituted within the template
+        docker_network: Optional[str]
+            Docker network to run the container in.
+        skip_pull_image: bool
+            Whether we should pull new Docker container image or not
+        container_env_var: Optional[dict]
+            An optional dictionary of environment variables to pass to the container
+        container_env_var_file: Optional[dict]
+            An optional path to file that contains environment variables to pass to the container
+        build_images: Optional[dict]
+            An optional dictionary of build images to be used for building functions
+        aws_region: Optional[str]
+            Aws region code
+        create_auto_dependency_layer: bool
+            Create auto dependency layer for accelerate feature
+        stack_name: Optional[str]
+            Original stack name, which is used to generate layer name for accelerate feature
+        print_success_message: bool
+            Print successful message
+        locate_layer_nested: bool
+            Locate layer to its actual, worked with nested stack
+        hook_name: Optional[str]
+            Name of the hook package
+        build_in_source: Optional[bool]
+            Set to True to build in the source directory.
+        mount_with:
+            Mount mode of source code directory when building inside container, READ ONLY by default
+        """
 
         self._resource_identifier = resource_identifier
         self._template_file = template_file
@@ -98,6 +166,7 @@ class BuildContext:
         self._container_env_var = container_env_var
         self._container_env_var_file = container_env_var_file
         self._build_images = build_images
+        self._exclude = excluded_resources
         self._create_auto_dependency_layer = create_auto_dependency_layer
         self._stack_name = stack_name
         self._print_success_message = print_success_message
@@ -106,6 +175,11 @@ class BuildContext:
         self._layer_provider: Optional[SamLayerProvider] = None
         self._container_manager: Optional[ContainerManager] = None
         self._stacks: List[Stack] = []
+        self._locate_layer_nested = locate_layer_nested
+        self._hook_name = hook_name
+        self._build_in_source = build_in_source
+        self._build_result: Optional[ApplicationBuildResult] = None
+        self._mount_with = MountMode(mount_with)
 
     def __enter__(self) -> "BuildContext":
         self.set_up()
@@ -130,7 +204,9 @@ class BuildContext:
         # Note(xinhol): self._use_raw_codeuri is added temporarily to fix issue #2717
         # when base_dir is provided, codeuri should not be resolved based on template file path.
         # we will refactor to make all path resolution inside providers intead of in multiple places
-        self._function_provider = SamFunctionProvider(self.stacks, self._use_raw_codeuri)
+        self._function_provider = SamFunctionProvider(
+            self.stacks, self._use_raw_codeuri, locate_layer_nested=self._locate_layer_nested
+        )
         self._layer_provider = SamLayerProvider(self.stacks, self._use_raw_codeuri)
 
         if not self._base_dir:
@@ -157,15 +233,29 @@ class BuildContext:
     def get_resources_to_build(self):
         return self.resources_to_build
 
-    def run(self):
+    def run(self) -> None:
         """Runs the building process by creating an ApplicationBuilder."""
-        template_dict = get_template_data(self._template_file)
-        template_transform = template_dict.get("Transform", "")
-        is_sam_template = isinstance(template_transform, str) and template_transform.startswith("AWS::Serverless")
-        if is_sam_template:
+        if self._is_sam_template():
             SamApiProvider.check_implicit_api_resource_ids(self.stacks)
 
+        self._stacks = self._handle_build_pre_processing()
+
+        caught_exception: Optional[Exception] = None
+
         try:
+            # boolean value indicates if mount with write or not, defaults to READ ONLY
+            mount_with_write = False
+            if self._use_container:
+                if self._mount_with == MountMode.WRITE:
+                    mount_with_write = True
+                else:
+                    # if self._mount_with is NOT WRITE
+                    # check the need of mounting with write permissions and prompt user to enable it if needed
+                    mount_with_write = prompt_user_to_enable_mount_with_write_if_needed(
+                        self.get_resources_to_build(),
+                        self.base_dir,
+                    )
+
             builder = ApplicationBuilder(
                 self.get_resources_to_build(),
                 self.build_dir,
@@ -181,34 +271,19 @@ class BuildContext:
                 container_env_var_file=self._container_env_var_file,
                 build_images=self._build_images,
                 combine_dependencies=not self._create_auto_dependency_layer,
+                build_in_source=self._build_in_source,
+                mount_with_write=mount_with_write,
             )
-        except FunctionNotFound as ex:
-            raise UserException(str(ex), wrapped_from=ex.__class__.__name__) from ex
 
-        try:
-            self._check_java_warning()
-            self._check_esbuild_warning()
-            build_result = builder.build()
-            artifacts = build_result.artifacts
+            self._check_exclude_warning()
+            self._check_rust_cargo_experimental_flag()
 
-            stack_output_template_path_by_stack_path = {
-                stack.stack_path: stack.get_output_template_path(self.build_dir) for stack in self.stacks
-            }
-            for stack in self.stacks:
-                modified_template = builder.update_template(
-                    stack,
-                    artifacts,
-                    stack_output_template_path_by_stack_path,
-                )
-                output_template_path = stack.get_output_template_path(self.build_dir)
+            for f in self.get_resources_to_build().functions:
+                EventTracker.track_event(EventName.BUILD_FUNCTION_RUNTIME.value, f.runtime)
 
-                if self._create_auto_dependency_layer:
-                    LOG.debug("Auto creating dependency layer for each function resource into a nested stack")
-                    nested_stack_manager = NestedStackManager(
-                        self._stack_name, self.build_dir, stack.location, modified_template, build_result
-                    )
-                    modified_template = nested_stack_manager.generate_auto_dependency_layer_stack()
-                move_template(stack.location, output_template_path, modified_template)
+            self._build_result = builder.build()
+
+            self._handle_build_post_processing(builder, self._build_result)
 
             click.secho("\nBuild Succeeded", fg="green")
 
@@ -226,22 +301,29 @@ class BuildContext:
                 output_template_path_in_success_message = out_template_path
 
             if self._print_success_message:
-                msg = self.gen_success_msg(
+                msg = self._gen_success_msg(
                     build_dir_in_success_message,
                     output_template_path_in_success_message,
                     os.path.abspath(self.build_dir) == os.path.abspath(DEFAULT_BUILD_DIR),
                 )
 
                 click.secho(msg, fg="yellow")
+        except FunctionNotFound as function_not_found_ex:
+            caught_exception = function_not_found_ex
 
+            raise UserException(
+                str(function_not_found_ex), wrapped_from=function_not_found_ex.__class__.__name__
+            ) from function_not_found_ex
         except (
             UnsupportedRuntimeException,
             BuildError,
             BuildInsideContainerError,
             UnsupportedBuilderLibraryVersionError,
-            ContainerBuildNotSupported,
             InvalidBuildGraphException,
+            ResourceNotFound,
         ) as ex:
+            caught_exception = ex
+
             click.secho("\nBuild Failed", fg="red")
 
             # Some Exceptions have a deeper wrapped exception that needs to be surfaced
@@ -249,29 +331,121 @@ class BuildContext:
             deep_wrap = getattr(ex, "wrapped_from", None)
             wrapped_from = deep_wrap if deep_wrap else ex.__class__.__name__
             raise UserException(str(ex), wrapped_from=wrapped_from) from ex
+        finally:
+            if self.build_in_source:
+                exception_name = type(caught_exception).__name__ if caught_exception else None
+                EventTracker.track_event(
+                    EventName.USED_FEATURE.value, UsedFeature.BUILD_IN_SOURCE.value, exception_name
+                )
 
-    @staticmethod
-    def gen_success_msg(artifacts_dir: str, output_template_path: str, is_default_build_dir: bool) -> str:
+    def _is_sam_template(self) -> bool:
+        """Check if a given template is a SAM template"""
+        template_dict = get_template_data(self._template_file)
+        template_transforms = template_dict.get("Transform", [])
+        if not isinstance(template_transforms, list):
+            template_transforms = [template_transforms]
+        for template_transform in template_transforms:
+            if isinstance(template_transform, str) and template_transform.startswith("AWS::Serverless"):
+                return True
+        return False
 
-        invoke_cmd = "sam local invoke"
-        if not is_default_build_dir:
-            invoke_cmd += " -t {}".format(output_template_path)
+    def _handle_build_pre_processing(self) -> List[Stack]:
+        """
+        Pre-modify the stacks as required before invoking the build
+        :return: List of modified stacks
+        """
+        stacks = []
+        if any(EsbuildBundlerManager(stack).esbuild_configured() for stack in self.stacks):
+            # esbuild is configured in one of the stacks, will check and update stack metadata accordingly
+            for stack in self.stacks:
+                stacks.append(EsbuildBundlerManager(stack).set_sourcemap_metadata_from_env())
+            self.function_provider.update(stacks, self._use_raw_codeuri, locate_layer_nested=self._locate_layer_nested)
+        return stacks if stacks else self.stacks
 
-        deploy_cmd = "sam deploy --guided"
-        if not is_default_build_dir:
-            deploy_cmd += " --template-file {}".format(output_template_path)
+    def _handle_build_post_processing(self, builder: ApplicationBuilder, build_result: ApplicationBuildResult) -> None:
+        """
+        Add any template modifications necessary before moving the template to build directory
+        :param stack: Stack resources
+        :param template: Current template file
+        :param build_result: Result of the application build
+        :return: Modified template dict
+        """
+        artifacts = build_result.artifacts
 
-        msg = """\nBuilt Artifacts  : {artifacts_dir}
-Built Template   : {template}
+        stack_output_template_path_by_stack_path = {
+            stack.stack_path: stack.get_output_template_path(self.build_dir) for stack in self.stacks
+        }
+        for stack in self.stacks:
+            modified_template = builder.update_template(
+                stack,
+                artifacts,
+                stack_output_template_path_by_stack_path,
+            )
+            output_template_path = stack.get_output_template_path(self.build_dir)
+
+            stack_name = self._stack_name if self._stack_name else ""
+            if self._create_auto_dependency_layer:
+                LOG.debug("Auto creating dependency layer for each function resource into a nested stack")
+                nested_stack_manager = NestedStackManager(
+                    stack, stack_name, self.build_dir, modified_template, build_result
+                )
+                modified_template = nested_stack_manager.generate_auto_dependency_layer_stack()
+
+            esbuild_manager = EsbuildBundlerManager(stack=stack, template=modified_template, build_dir=self.build_dir)
+            if esbuild_manager.esbuild_configured():
+                modified_template = esbuild_manager.handle_template_post_processing()
+
+            move_template(stack.location, output_template_path, modified_template)
+
+    def _gen_success_msg(self, artifacts_dir: str, output_template_path: str, is_default_build_dir: bool) -> str:
+        """
+        Generates a success message containing some suggested commands to run
+
+        Parameters
+        ----------
+        artifacts_dir: str
+            A string path representing the folder of built artifacts
+        output_template_path: str
+            A string path representing the final template file
+        is_default_build_dir: bool
+            True if the build folder is the folder defined by SAM CLI
+
+        Returns
+        -------
+        str
+            A formatted success message string
+        """
+
+        validate_suggestion = "Validate SAM template: sam validate"
+        invoke_suggestion = "Invoke Function: sam local invoke"
+        sync_suggestion = "Test Function in the Cloud: sam sync --stack-name {{stack-name}} --watch"
+        deploy_suggestion = "Deploy: sam deploy --guided"
+        start_lambda_suggestion = "Emulate local Lambda functions: sam local start-lambda"
+
+        if not is_default_build_dir and not self._hook_name:
+            invoke_suggestion += " -t {}".format(output_template_path)
+            deploy_suggestion += " --template-file {}".format(output_template_path)
+
+        commands = [validate_suggestion, invoke_suggestion, sync_suggestion, deploy_suggestion]
+
+        # check if we have used a hook package before building
+        if self._hook_name:
+            hook_package_flag = f" --hook-name {self._hook_name}"
+
+            start_lambda_suggestion += hook_package_flag
+            invoke_suggestion += hook_package_flag
+
+            commands = [invoke_suggestion, start_lambda_suggestion]
+
+        msg = f"""\nBuilt Artifacts  : {artifacts_dir}
+Built Template   : {output_template_path}
 
 Commands you can use next
 =========================
-[*] Invoke Function: {invokecmd}
-[*] Test Function in the Cloud: sam sync --stack-name {{stack-name}} --watch
-[*] Deploy: {deploycmd}
-        """.format(
-            invokecmd=invoke_cmd, deploycmd=deploy_cmd, artifacts_dir=artifacts_dir, template=output_template_path
-        )
+"""
+
+        # add bullet point then join all the commands with new line
+        msg += "[*] " + f"{os.linesep}[*] ".join(commands)
 
         return msg
 
@@ -351,6 +525,10 @@ Commands you can use next
         return self._mode
 
     @property
+    def use_base_dir(self) -> bool:
+        return self._use_raw_codeuri
+
+    @property
     def resources_to_build(self) -> ResourcesToBuildCollector:
         """
         Function return resources that should be build by current build command. This function considers
@@ -368,6 +546,10 @@ Commands you can use next
     @property
     def create_auto_dependency_layer(self) -> bool:
         return self._create_auto_dependency_layer
+
+    @property
+    def build_result(self) -> Optional[ApplicationBuildResult]:
+        return self._build_result
 
     def collect_build_resources(self, resource_identifier: str) -> ResourcesToBuildCollector:
         """Collect a single buildable resource and its dependencies.
@@ -395,8 +577,8 @@ Commands you can use next
 
         if not result.functions and not result.layers:
             # Collect all functions and layers that are not inline
-            all_resources = [f.name for f in self.function_provider.get_all() if not f.inlinecode]
-            all_resources.extend([l.name for l in self.layer_provider.get_all()])
+            all_resources = [func.name for func in self.function_provider.get_all() if not func.inlinecode]
+            all_resources.extend([layer.name for layer in self.layer_provider.get_all()])
 
             available_resource_message = (
                 f"{resource_identifier} not found. Possible options in your " f"template: {all_resources}"
@@ -414,8 +596,21 @@ Commands you can use next
             ResourcesToBuildCollector that contains all the buildable resources.
         """
         result = ResourcesToBuildCollector()
-        result.add_functions([f for f in self.function_provider.get_all() if BuildContext._is_function_buildable(f)])
-        result.add_layers([l for l in self.layer_provider.get_all() if BuildContext._is_layer_buildable(l)])
+        excludes: Tuple[str, ...] = self._exclude if self._exclude is not None else ()
+        result.add_functions(
+            [
+                func
+                for func in self.function_provider.get_all()
+                if (func.name not in excludes) and func.function_build_info.is_buildable()
+            ]
+        )
+        result.add_layers(
+            [
+                layer
+                for layer in self.layer_provider.get_all()
+                if (layer.name not in excludes) and BuildContext.is_layer_buildable(layer)
+            ]
+        )
         return result
 
     @property
@@ -444,7 +639,7 @@ Commands you can use next
             return
 
         resource_collector.add_function(function)
-        resource_collector.add_layers([l for l in function.layers if l.build_method is not None and not l.skip_build])
+        resource_collector.add_layers([layer for layer in function.layers if BuildContext.is_layer_buildable(layer)])
 
     def _collect_single_buildable_layer(
         self, resource_identifier: str, resource_collector: ResourcesToBuildCollector
@@ -471,35 +666,7 @@ Commands you can use next
         resource_collector.add_layer(layer)
 
     @staticmethod
-    def _is_function_buildable(function: Function):
-        # no need to build inline functions
-        if function.inlinecode:
-            LOG.debug("Skip building inline function: %s", function.full_path)
-            return False
-        # no need to build functions that are already packaged as a zip file
-        if isinstance(function.codeuri, str) and function.codeuri.endswith(".zip"):
-            LOG.debug("Skip building zip function: %s", function.full_path)
-            return False
-        # skip build the functions that marked as skip-build
-        if function.skip_build:
-            LOG.debug("Skip building pre-built function: %s", function.full_path)
-            return False
-        # skip build the functions with Image Package Type with no docker context or docker file metadata
-        if function.packagetype == IMAGE:
-            metadata = function.metadata if function.metadata else {}
-            dockerfile = cast(str, metadata.get("Dockerfile", ""))
-            docker_context = cast(str, metadata.get("DockerContext", ""))
-            if not dockerfile or not docker_context:
-                LOG.debug(
-                    "Skip Building %s function, as it does not contain either Dockerfile or DockerContext "
-                    "metadata properties.",
-                    function.full_path,
-                )
-                return False
-        return True
-
-    @staticmethod
-    def _is_layer_buildable(layer: LayerVersion):
+    def is_layer_buildable(layer: LayerVersion):
         # if build method is not specified, it is not buildable
         if not layer.build_method:
             LOG.debug("Skip building layer without a build method: %s", layer.full_path)
@@ -514,48 +681,35 @@ Commands you can use next
             return False
         return True
 
-    _JAVA_BUILD_WARNING_MESSAGE = (
-        "Test the latest build changes for Java runtime 'SAM_CLI_BETA_MAVEN_SCOPE_AND_LAYER=1 sam build'. "
-        "These changes will replace the existing flow on 1st of April 2022. "
-        "Check https://github.com/aws/aws-sam-cli/issues/3639 for more information."
-    )
+    _EXCLUDE_WARNING_MESSAGE = "Resource expected to be built, but marked as excluded.\nBuilding anyways..."
 
-    _ESBUILD_WARNING_MESSAGE = (
-        "Using esbuild for bundling Node.js and TypeScript is a beta feature.\n"
-        "Please confirm if you would like to proceed with using esbuild to build your function.\n"
-        "You can also enable this beta feature with 'sam build --beta-features'."
-    )
+    def _check_exclude_warning(self) -> None:
+        """
+        Prints warning message if a single resource to build is also being excluded
+        """
+        excludes: Tuple[str, ...] = self._exclude if self._exclude is not None else ()
+        if self._resource_identifier in excludes:
+            LOG.warning(self._EXCLUDE_WARNING_MESSAGE)
 
-    def _check_java_warning(self) -> None:
+    def _check_rust_cargo_experimental_flag(self) -> None:
         """
-        Prints warning message about upcoming changes to building java functions and layers.
-        This warning message will only be printed if template contains any buildable functions or layers with one of
-        the java runtimes.
+        Prints warning message and confirms if user wants to use beta feature
         """
-        # display warning message for java runtimes for changing build method
+        WARNING_MESSAGE = (
+            'Build method "rust-cargolambda" is a beta feature.\n'
+            "Please confirm if you would like to proceed\n"
+            'You can also enable this beta feature with "sam build --beta-features".'
+        )
         resources_to_build = self.get_resources_to_build()
-        function_runtimes = {function.runtime for function in resources_to_build.functions if function.runtime}
-        layer_build_methods = {layer.build_method for layer in resources_to_build.layers if layer.build_method}
-
-        is_building_java = False
-        for runtime_or_build_method in set.union(function_runtimes, layer_build_methods):
-            if runtime_or_build_method.startswith("java"):
-                is_building_java = True
-                break
-
-        if is_building_java and not is_experimental_enabled(ExperimentalFlag.JavaMavenBuildScope):
-            click.secho(self._JAVA_BUILD_WARNING_MESSAGE, fg="yellow")
-
-    def _check_esbuild_warning(self) -> None:
-        """
-        Prints warning message and confirms that the user wants to enable beta features
-        """
-        resources_to_build = self.get_resources_to_build()
-        is_building_esbuild = False
+        is_building_rust = False
         for function in resources_to_build.functions:
-            if function.metadata and function.metadata.get("BuildMethod", "") == "esbuild":
-                is_building_esbuild = True
+            if function.metadata and function.metadata.get("BuildMethod", "") == "rust-cargolambda":
+                is_building_rust = True
                 break
 
-        if is_building_esbuild:
-            prompt_experimental(ExperimentalFlag.Esbuild, self._ESBUILD_WARNING_MESSAGE)
+        if is_building_rust:
+            prompt_experimental(ExperimentalFlag.RustCargoLambda, WARNING_MESSAGE)
+
+    @property
+    def build_in_source(self) -> Optional[bool]:
+        return self._build_in_source

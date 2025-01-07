@@ -1,12 +1,23 @@
 """
 Tests the InvokeContext class
 """
+
 import errno
 import os
 
+from parameterized import parameterized
+
+from samcli.lib.utils.packagetype import ZIP
 from samcli.commands._utils.template import TemplateFailedParsingException
-from samcli.commands.local.cli_common.user_exceptions import InvokeContextException, DebugContextException
-from samcli.commands.local.cli_common.invoke_context import InvokeContext, ContainersInitializationMode, ContainersMode
+from samcli.commands.local.cli_common.invoke_context import (
+    InvokeContext,
+    ContainersInitializationMode,
+    ContainersMode,
+    DebugContextException,
+    DockerIsNotReachableException,
+    NoFunctionIdentifierProvidedException,
+    InvalidEnvironmentVariablesFileException,
+)
 
 from unittest import TestCase
 from unittest.mock import Mock, PropertyMock, patch, ANY, mock_open, call
@@ -17,8 +28,22 @@ from samcli.lib.providers.provider import Stack
 class TestInvokeContext__enter__(TestCase):
     @patch("samcli.commands.local.cli_common.invoke_context.ContainerManager")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
-    def test_must_read_from_necessary_files(self, SamFunctionProviderMock, ContainerManagerMock):
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
+    def test_must_read_from_necessary_files(
+        self, _add_account_id_to_global_mock, SamFunctionProviderMock, ContainerManagerMock
+    ):
         function_provider = Mock()
+        function_provider.get_all.return_value = [
+            Mock(
+                functionname="name",
+                function_id="id",
+                handler="app.handler",
+                runtime="test",
+                packagetype=ZIP,
+                inlinecode="| \
+                exports.handler = async () => 'Hello World!'",
+            )
+        ]
 
         SamFunctionProviderMock.return_value = function_provider
 
@@ -69,6 +94,7 @@ class TestInvokeContext__enter__(TestCase):
         result = invoke_context.__enter__()
         self.assertTrue(result is invoke_context, "__enter__() must return self")
 
+        function_provider.get_all.assert_called_once()
         self.assertEqual(invoke_context._function_provider, function_provider)
         self.assertEqual(invoke_context._env_vars_value, env_vars_value)
         self.assertEqual(invoke_context._log_file_handle, log_file_handle)
@@ -79,7 +105,7 @@ class TestInvokeContext__enter__(TestCase):
         self.assertEqual(invoke_context._invoke_images, {None: "image"})
 
         invoke_context._get_stacks.assert_called_once()
-        SamFunctionProviderMock.assert_called_with(stacks)
+        SamFunctionProviderMock.assert_called_with(stacks, True)
         self.assertEqual(invoke_context._global_parameter_overrides, {"AWS::Region": "region"})
         self.assertEqual(invoke_context._get_env_vars_value.call_count, 2)
         self.assertEqual(invoke_context._get_env_vars_value.call_args_list, [call(env_vars_file), call(None)])
@@ -93,8 +119,9 @@ class TestInvokeContext__enter__(TestCase):
 
     @patch("samcli.commands.local.cli_common.invoke_context.ContainerManager")
     @patch("samcli.commands.local.cli_common.invoke_context.RefreshableSamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_must_initialize_all_containers_if_warm_containers_is_enabled(
-        self, RefreshableSamFunctionProviderMock, ContainerManagerMock
+        self, _add_account_id_to_global_mock, RefreshableSamFunctionProviderMock, ContainerManagerMock
     ):
         function_provider = Mock()
         function = Mock()
@@ -165,7 +192,9 @@ class TestInvokeContext__enter__(TestCase):
         self.assertEqual(invoke_context._invoke_images, {None: "image"})
 
         invoke_context._get_stacks.assert_called_once()
-        RefreshableSamFunctionProviderMock.assert_called_with(stacks, parameter_overrides, global_parameter_overrides)
+        RefreshableSamFunctionProviderMock.assert_called_with(
+            stacks, parameter_overrides, global_parameter_overrides, True
+        )
         self.assertEqual(invoke_context._global_parameter_overrides, global_parameter_overrides)
         self.assertEqual(invoke_context._get_env_vars_value.call_count, 2)
         self.assertEqual(invoke_context._get_env_vars_value.call_args_list, [call(env_vars_file), call(None)])
@@ -180,11 +209,16 @@ class TestInvokeContext__enter__(TestCase):
 
     @patch("samcli.commands.local.cli_common.invoke_context.ContainerManager")
     @patch("samcli.commands.local.cli_common.invoke_context.RefreshableSamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_must_set_debug_function_if_warm_containers_enabled_no_debug_function_provided_and_template_contains_one_function(
-        self, RefreshableSamFunctionProviderMock, ContainerManagerMock
+        self, _add_account_id_to_global_mock, RefreshableSamFunctionProviderMock, ContainerManagerMock
     ):
         function_provider = Mock()
-        function_provider.functions = {"function_name": ANY}
+        function = Mock(
+            functionname="function_name", handler="app.handler", runtime="test", packagetype=ZIP, inlinecode=None
+        )
+        function_provider.functions = {"function_name": function}
+        function_provider.get_all.return_value = [function]
         RefreshableSamFunctionProviderMock.return_value = function_provider
 
         template_file = "template_file"
@@ -252,7 +286,9 @@ class TestInvokeContext__enter__(TestCase):
         self.assertEqual(invoke_context._invoke_images, {None: "image"})
 
         invoke_context._get_stacks.assert_called_once()
-        RefreshableSamFunctionProviderMock.assert_called_with(stacks, parameter_overrides, global_parameter_overrides)
+        RefreshableSamFunctionProviderMock.assert_called_with(
+            stacks, parameter_overrides, global_parameter_overrides, True
+        )
         self.assertEqual(invoke_context._global_parameter_overrides, global_parameter_overrides)
         self.assertEqual(invoke_context._get_env_vars_value.call_count, 2)
         self.assertEqual(
@@ -269,10 +305,14 @@ class TestInvokeContext__enter__(TestCase):
 
     @patch("samcli.commands.local.cli_common.invoke_context.ContainerManager")
     @patch("samcli.commands.local.cli_common.invoke_context.RefreshableSamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_no_container_will_be_initialized_if_lazy_containers_is_enabled(
-        self, RefreshableSamFunctionProviderMock, ContainerManagerMock
+        self, _add_account_id_to_global_mock, RefreshableSamFunctionProviderMock, ContainerManagerMock
     ):
         function_provider = Mock()
+        function_provider.get_all.return_value = [
+            Mock(functionname="function_name", handler="app.handler", runtime="test", packagetype=ZIP, inlinecode=None)
+        ]
 
         RefreshableSamFunctionProviderMock.return_value = function_provider
 
@@ -337,7 +377,9 @@ class TestInvokeContext__enter__(TestCase):
         self.assertEqual(invoke_context._invoke_images, {None: "image"})
 
         invoke_context._get_stacks.assert_called_once()
-        RefreshableSamFunctionProviderMock.assert_called_with(stacks, parameter_overrides, global_parameter_overrides)
+        RefreshableSamFunctionProviderMock.assert_called_with(
+            stacks, parameter_overrides, global_parameter_overrides, True
+        )
         self.assertEqual(invoke_context._global_parameter_overrides, global_parameter_overrides)
         self.assertEqual(invoke_context._get_env_vars_value.call_count, 2)
         self.assertEqual(invoke_context._get_env_vars_value.call_args_list, [call(env_vars_file), call(None)])
@@ -394,11 +436,10 @@ class TestInvokeContext__enter__(TestCase):
             new_callable=PropertyMock,
             return_value=False,
         ):
-
             invoke_context._get_container_manager = Mock()
             invoke_context._get_container_manager.return_value = container_manager_mock
 
-            with self.assertRaises(InvokeContextException) as ex_ctx:
+            with self.assertRaises(DockerIsNotReachableException) as ex_ctx:
                 invoke_context.__enter__()
 
                 self.assertEqual(
@@ -411,8 +452,36 @@ class TestInvokeContext__enter__(TestCase):
         invoke_context = InvokeContext("template-file")
 
         get_buildable_stacks_mock.side_effect = TemplateFailedParsingException("")
-        with self.assertRaises(InvokeContextException) as ex_ctx:
+        with self.assertRaises(TemplateFailedParsingException) as ex_ctx:
             invoke_context.__enter__()
+
+    @parameterized.expand(
+        [
+            (None, "/my/cool/path", True),
+            ("LAZY", "/my/cool/path", True),
+            (None, None, False),
+        ]
+    )
+    @patch("samcli.lib.providers.sam_function_provider.SamFunctionProvider._extract_functions")
+    @patch("samcli.lib.utils.file_observer.SingletonFileObserver.start")
+    def test_docker_volume_basedir_set_use_raw_codeuri(
+        self, container_mode, docker_volume_basedir, expected, observer_mock, extract_func_mock
+    ):
+        invoke_context = InvokeContext(
+            "template",
+            warm_container_initialization_mode=container_mode,
+            docker_volume_basedir=docker_volume_basedir,
+            shutdown=True,
+        )
+
+        invoke_context._initialize_all_functions_containers = Mock()
+        invoke_context._get_container_manager = Mock(return_value=Mock())
+        invoke_context._get_debug_context = Mock(return_value=Mock())
+        invoke_context._get_stacks = Mock(return_value=[])
+
+        invoke_context.__enter__()
+
+        extract_func_mock.assert_called_with([], expected, False, False)
 
 
 class TestInvokeContext__exit__(TestCase):
@@ -441,8 +510,8 @@ class TestInvokeContextAsContextManager(TestCase):
 
     @patch.object(InvokeContext, "__enter__")
     @patch.object(InvokeContext, "__exit__")
-    def test_must_work_in_with_statement(self, ExitMock, EnterMock):
-
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
+    def test_must_work_in_with_statement(self, _add_account_id_to_global_mock, ExitMock, EnterMock):
         context_obj = Mock()
         EnterMock.return_value = context_obj
 
@@ -489,20 +558,28 @@ class TestInvokeContext_function_name_property(TestCase):
         context._function_provider = Mock()
         context._function_provider.get_all.return_value = [Mock(), Mock(), Mock()]  # Provider returns three functions
 
-        with self.assertRaises(InvokeContextException):
+        with self.assertRaises(NoFunctionIdentifierProvidedException):
             context.function_identifier
 
 
 class TestInvokeContext_local_lambda_runner(TestCase):
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaImage")
     @patch("samcli.commands.local.cli_common.invoke_context.LayerDownloader")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaRuntime")
     @patch("samcli.commands.local.cli_common.invoke_context.LocalLambdaRunner")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_must_create_runner(
-        self, SamFunctionProviderMock, LocalLambdaMock, LambdaRuntimeMock, download_layers_mock, lambda_image_patch
+        self,
+        _add_account_id_to_global_mock,
+        SamFunctionProviderMock,
+        LocalLambdaMock,
+        LambdaRuntimeMock,
+        download_layers_mock,
+        lambda_image_patch,
+        LambdaFunctionObserver_patch,
     ):
-
         runtime_mock = Mock()
         LambdaRuntimeMock.return_value = runtime_mock
 
@@ -514,6 +591,9 @@ class TestInvokeContext_local_lambda_runner(TestCase):
 
         image_mock = Mock()
         lambda_image_patch.return_value = image_mock
+
+        LambdaFunctionObserver_mock = Mock()
+        LambdaFunctionObserver_patch.return_value = LambdaFunctionObserver_mock
 
         cwd = "cwd"
         self.context = InvokeContext(
@@ -554,12 +634,14 @@ class TestInvokeContext_local_lambda_runner(TestCase):
                 local_runtime=runtime_mock,
                 function_provider=ANY,
                 cwd=cwd,
+                real_path=ANY,
                 debug_context=None,
                 env_vars_values=ANY,
                 aws_profile="profile",
                 aws_region="region",
                 container_host=None,
                 container_host_interface=None,
+                extra_hosts=None,
             )
 
             result = self.context.local_lambda_runner
@@ -572,8 +654,10 @@ class TestInvokeContext_local_lambda_runner(TestCase):
     @patch("samcli.commands.local.cli_common.invoke_context.WarmLambdaRuntime")
     @patch("samcli.commands.local.cli_common.invoke_context.LocalLambdaRunner")
     @patch("samcli.commands.local.cli_common.invoke_context.RefreshableSamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_must_create_runner_using_warm_containers(
         self,
+        _add_account_id_to_global_mock,
         RefreshableSamFunctionProviderMock,
         LocalLambdaMock,
         WarmLambdaRuntimeMock,
@@ -632,12 +716,14 @@ class TestInvokeContext_local_lambda_runner(TestCase):
                 local_runtime=runtime_mock,
                 function_provider=ANY,
                 cwd=cwd,
+                real_path=ANY,
                 debug_context=None,
                 env_vars_values=ANY,
                 aws_profile="profile",
                 aws_region="region",
                 container_host=None,
                 container_host_interface=None,
+                extra_hosts=None,
             )
 
             result = self.context.local_lambda_runner
@@ -645,13 +731,22 @@ class TestInvokeContext_local_lambda_runner(TestCase):
             # assert that lambda runner is created only one time, and the cached version used in the second call
             self.assertEqual(LocalLambdaMock.call_count, 1)
 
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaImage")
     @patch("samcli.commands.local.cli_common.invoke_context.LayerDownloader")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaRuntime")
     @patch("samcli.commands.local.cli_common.invoke_context.LocalLambdaRunner")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
     def test_must_create_runner_with_container_host_option(
-        self, SamFunctionProviderMock, LocalLambdaMock, LambdaRuntimeMock, download_layers_mock, lambda_image_patch
+        self,
+        _add_account_id_to_global_mock,
+        SamFunctionProviderMock,
+        LocalLambdaMock,
+        LambdaRuntimeMock,
+        download_layers_mock,
+        lambda_image_patch,
+        LambdaFunctionObserver_patch,
     ):
         runtime_mock = Mock()
         LambdaRuntimeMock.return_value = runtime_mock
@@ -664,6 +759,9 @@ class TestInvokeContext_local_lambda_runner(TestCase):
 
         image_mock = Mock()
         lambda_image_patch.return_value = image_mock
+
+        LambdaFunctionObserver_mock = Mock()
+        LambdaFunctionObserver_patch.return_value = LambdaFunctionObserver_mock
 
         cwd = "cwd"
         self.context = InvokeContext(
@@ -706,12 +804,14 @@ class TestInvokeContext_local_lambda_runner(TestCase):
                 local_runtime=runtime_mock,
                 function_provider=ANY,
                 cwd=cwd,
+                real_path=ANY,
                 debug_context=None,
                 env_vars_values=ANY,
                 aws_profile="profile",
                 aws_region="region",
                 container_host="abcdef",
                 container_host_interface="192.168.100.101",
+                extra_hosts=None,
             )
 
             result = self.context.local_lambda_runner
@@ -719,15 +819,23 @@ class TestInvokeContext_local_lambda_runner(TestCase):
             # assert that lambda runner is created only one time, and the cached version used in the second call
             self.assertEqual(LocalLambdaMock.call_count, 1)
 
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaImage")
     @patch("samcli.commands.local.cli_common.invoke_context.LayerDownloader")
     @patch("samcli.commands.local.cli_common.invoke_context.LambdaRuntime")
     @patch("samcli.commands.local.cli_common.invoke_context.LocalLambdaRunner")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
-    def test_must_create_runner_with_invoke_image_option(
-        self, SamFunctionProviderMock, LocalLambdaMock, LambdaRuntimeMock, download_layers_mock, lambda_image_patch
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
+    def test_must_create_runner_with_extra_hosts_option(
+        self,
+        _add_account_id_to_global_mock,
+        SamFunctionProviderMock,
+        LocalLambdaMock,
+        LambdaRuntimeMock,
+        download_layers_mock,
+        lambda_image_patch,
+        LambdaFunctionObserver_patch,
     ):
-
         runtime_mock = Mock()
         LambdaRuntimeMock.return_value = runtime_mock
 
@@ -739,6 +847,100 @@ class TestInvokeContext_local_lambda_runner(TestCase):
 
         image_mock = Mock()
         lambda_image_patch.return_value = image_mock
+
+        LambdaFunctionObserver_mock = Mock()
+        LambdaFunctionObserver_patch.return_value = LambdaFunctionObserver_mock
+
+        cwd = "cwd"
+        self.context = InvokeContext(
+            template_file="template_file",
+            function_identifier="id",
+            env_vars_file="env_vars_file",
+            docker_volume_basedir="volumedir",
+            docker_network="network",
+            log_file="log_file",
+            skip_pull_image=True,
+            force_image_build=True,
+            debug_ports=[1111],
+            debugger_path="path-to-debugger",
+            debug_args="args",
+            aws_profile="profile",
+            aws_region="region",
+            container_host="abcdef",
+            add_host={"prod-na.host": "10.11.12.13", "gamma-na.host": "10.22.23.24"},
+        )
+        self.context.get_cwd = Mock()
+        self.context.get_cwd.return_value = cwd
+
+        self.context._get_stacks = Mock()
+        self.context._get_stacks.return_value = [Mock()]
+        self.context._get_env_vars_value = Mock()
+        self.context._setup_log_file = Mock()
+        self.context._get_debug_context = Mock(return_value=None)
+
+        container_manager_mock = Mock()
+        container_manager_mock.is_docker_reachable = PropertyMock(return_value=True)
+        self.context._get_container_manager = Mock(return_value=container_manager_mock)
+
+        with self.context:
+            result = self.context.local_lambda_runner
+            self.assertEqual(result, runner_mock)
+
+            LambdaRuntimeMock.assert_called_with(container_manager_mock, image_mock)
+            lambda_image_patch.assert_called_once_with(download_mock, True, True, invoke_images=None)
+            LocalLambdaMock.assert_called_with(
+                local_runtime=runtime_mock,
+                function_provider=ANY,
+                cwd=cwd,
+                real_path=ANY,
+                debug_context=None,
+                env_vars_values=ANY,
+                aws_profile="profile",
+                aws_region="region",
+                container_host="abcdef",
+                container_host_interface=None,
+                extra_hosts={
+                    "prod-na.host": "10.11.12.13",
+                    "gamma-na.host": "10.22.23.24",
+                },
+            )
+
+            result = self.context.local_lambda_runner
+            self.assertEqual(result, runner_mock)
+            # assert that lambda runner is created only one time, and the cached version used in the second call
+            self.assertEqual(LocalLambdaMock.call_count, 1)
+
+    @patch("samcli.local.lambdafn.runtime.LambdaFunctionObserver")
+    @patch("samcli.commands.local.cli_common.invoke_context.LambdaImage")
+    @patch("samcli.commands.local.cli_common.invoke_context.LayerDownloader")
+    @patch("samcli.commands.local.cli_common.invoke_context.LambdaRuntime")
+    @patch("samcli.commands.local.cli_common.invoke_context.LocalLambdaRunner")
+    @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
+    def test_must_create_runner_with_invoke_image_option(
+        self,
+        _add_account_id_to_global_mock,
+        SamFunctionProviderMock,
+        LocalLambdaMock,
+        LambdaRuntimeMock,
+        download_layers_mock,
+        lambda_image_patch,
+        LambdaFunctionObserver_patch,
+    ):
+        runtime_mock = Mock()
+        LambdaRuntimeMock.return_value = runtime_mock
+
+        runner_mock = Mock()
+        LocalLambdaMock.return_value = runner_mock
+
+        download_mock = Mock()
+        download_layers_mock.return_value = download_mock
+
+        image_mock = Mock()
+        lambda_image_patch.return_value = image_mock
+
+        LambdaFunctionObserver_mock = Mock()
+        LambdaFunctionObserver_patch.return_value = LambdaFunctionObserver_mock
 
         cwd = "cwd"
         self.context = InvokeContext(
@@ -780,12 +982,14 @@ class TestInvokeContext_local_lambda_runner(TestCase):
                 local_runtime=runtime_mock,
                 function_provider=ANY,
                 cwd=cwd,
+                real_path=ANY,
                 debug_context=None,
                 env_vars_values=ANY,
                 aws_profile="profile",
                 aws_region="region",
                 container_host=None,
                 container_host_interface=None,
+                extra_hosts=None,
             )
 
             result = self.context.local_lambda_runner
@@ -849,8 +1053,7 @@ class TestInvokeContext_stdout_property(TestCase):
     @patch.object(InvokeContext, "__exit__")
     @patch("samcli.commands.local.cli_common.invoke_context.StreamWriter")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
-    def test_must_use_log_file_handle(self, StreamWriterMock, SamFunctionProviderMock, ExitMock):
-
+    def test_must_use_log_file_handle(self, SamFunctionProviderMock, StreamWriterMock, ExitMock):
         stream_writer_mock = Mock()
         StreamWriterMock.return_value = stream_writer_mock
 
@@ -880,7 +1083,6 @@ class TestInvokeContext_stderr_property(TestCase):
     @patch("samcli.commands.local.cli_common.invoke_context.StreamWriter")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
     def test_must_enable_auto_flush(self, SamFunctionProviderMock, StreamWriterMock, osutils_stderr_mock, ExitMock):
-
         context = InvokeContext(template_file="template", debug_ports=[6000])
 
         context._get_stacks = Mock()
@@ -904,7 +1106,6 @@ class TestInvokeContext_stderr_property(TestCase):
     def test_must_use_stderr_if_no_log_file_handle(
         self, SamFunctionProviderMock, StreamWriterMock, osutils_stderr_mock, ExitMock
     ):
-
         stream_writer_mock = Mock()
         StreamWriterMock.return_value = stream_writer_mock
 
@@ -931,8 +1132,7 @@ class TestInvokeContext_stderr_property(TestCase):
     @patch.object(InvokeContext, "__exit__")
     @patch("samcli.commands.local.cli_common.invoke_context.StreamWriter")
     @patch("samcli.commands.local.cli_common.invoke_context.SamFunctionProvider")
-    def test_must_use_log_file_handle(self, StreamWriterMock, SamFunctionProviderMock, ExitMock):
-
+    def test_must_use_log_file_handle(self, SamFunctionProviderMock, StreamWriterMock, ExitMock):
         stream_writer_mock = Mock()
         StreamWriterMock.return_value = stream_writer_mock
 
@@ -1000,8 +1200,7 @@ class TestInvokeContext_get_env_vars_value(TestCase):
         m = mock_open(read_data=file_data)
 
         with patch("samcli.commands.local.cli_common.invoke_context.open", m):
-
-            with self.assertRaises(InvokeContextException) as ex_ctx:
+            with self.assertRaises(InvalidEnvironmentVariablesFileException) as ex_ctx:
                 InvokeContext._get_env_vars_value(filename)
 
             msg = str(ex_ctx.exception)
@@ -1022,7 +1221,7 @@ class TestInvokeContext_setup_log_file(TestCase):
         with patch("samcli.commands.local.cli_common.invoke_context.open", m):
             InvokeContext._setup_log_file(filename)
 
-        m.assert_called_with(filename, "wb")
+        m.assert_called_with(filename, "w", encoding="utf8")
 
 
 class TestInvokeContext_get_debug_context(TestCase):
@@ -1171,10 +1370,27 @@ class TestInvokeContext_get_debug_context(TestCase):
 
 class TestInvokeContext_get_stacks(TestCase):
     @patch("samcli.commands.local.cli_common.invoke_context.SamLocalStackProvider.get_stacks")
-    def test_must_pass_custom_region(self, get_stacks_mock):
+    @patch("samcli.commands.local.cli_common.invoke_context.InvokeContext._add_account_id_to_global")
+    def test_must_pass_custom_region(self, add_account_id_to_global_mock, get_stacks_mock):
         get_stacks_mock.return_value = [Mock(), []]
         invoke_context = InvokeContext("template_file", aws_region="my-custom-region")
         invoke_context._get_stacks()
         get_stacks_mock.assert_called_with(
             "template_file", parameter_overrides=None, global_parameter_overrides={"AWS::Region": "my-custom-region"}
         )
+
+
+class TestInvokeContext_add_account_id_to_global(TestCase):
+    def test_must_work_with_no_token(self):
+        invoke_context = InvokeContext("template_file")
+        invoke_context._add_account_id_to_global()
+        self.assertIsNone(invoke_context._global_parameter_overrides)
+
+    @patch("samcli.commands.local.cli_common.invoke_context.get_boto_client_provider_with_config")
+    def test_must_work_with_token(self, get_boto_client_provider_with_config_mock):
+        get_boto_client_provider_with_config_mock.return_value.return_value.get_caller_identity.return_value.get.return_value = (
+            "210987654321"
+        )
+        invoke_context = InvokeContext("template_file")
+        invoke_context._add_account_id_to_global()
+        self.assertEqual(invoke_context._global_parameter_overrides.get("AWS::AccountId"), "210987654321")

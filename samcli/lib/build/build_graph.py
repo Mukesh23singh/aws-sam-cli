@@ -6,22 +6,24 @@ import copy
 import logging
 import os
 import threading
-from pathlib import Path
-from typing import Sequence, Tuple, List, Any, Optional, Dict, cast, NamedTuple
+from abc import abstractmethod
 from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 from uuid import uuid4
 
 import tomlkit
+from tomlkit.toml_document import TOMLDocument
 
+from samcli.commands._utils.experimental import ExperimentalFlag, is_experimental_enabled
 from samcli.lib.build.exceptions import InvalidBuildGraphException
 from samcli.lib.providers.provider import Function, LayerVersion
 from samcli.lib.samlib.resource_metadata_normalizer import (
-    SAM_RESOURCE_ID_KEY,
     SAM_IS_NORMALIZED,
+    SAM_RESOURCE_ID_KEY,
 )
-from samcli.lib.utils.packagetype import ZIP
 from samcli.lib.utils.architecture import X86_64
-
+from samcli.lib.utils.packagetype import ZIP
 
 LOG = logging.getLogger(__name__)
 
@@ -44,6 +46,10 @@ COMPATIBLE_RUNTIMES_FIELD = "compatible_runtimes"
 LAYER_FIELD = "layer"
 ARCHITECTURE_FIELD = "architecture"
 HANDLER_FIELD = "handler"
+SHARED_CODEURI_SUFFIX = "Shared"
+
+# Compiled runtimes that we need to compare handlers for
+COMPILED_RUNTIMES = ["go1.x"]
 
 
 def _function_build_definition_to_toml_table(
@@ -101,6 +107,7 @@ def _toml_table_to_function_build_definition(uuid: str, toml_table: tomlkit.api.
     function_build_definition = FunctionBuildDefinition(
         toml_table.get(RUNTIME_FIELD),
         toml_table.get(CODE_URI_FIELD),
+        None,
         toml_table.get(PACKAGETYPE_FIELD, ZIP),
         toml_table.get(ARCHITECTURE_FIELD, X86_64),
         dict(toml_table.get(METADATA_FIELD, {})),
@@ -160,7 +167,7 @@ def _toml_table_to_layer_build_definition(uuid: str, toml_table: tomlkit.api.Tab
         LayerBuildDefinition of given toml table
     """
     layer_build_definition = LayerBuildDefinition(
-        toml_table.get(LAYER_NAME_FIELD),
+        toml_table.get(LAYER_NAME_FIELD, ""),
         toml_table.get(CODE_URI_FIELD),
         toml_table.get(BUILD_METHOD_FIELD),
         toml_table.get(COMPATIBLE_RUNTIMES_FIELD),
@@ -368,7 +375,6 @@ class BuildGraph:
         """
         Helper to write source_hash values to build.toml file
         """
-        document = {}
         if not self._filepath.exists():
             open(self._filepath, "a+").close()  # pylint: disable=consider-using-with
 
@@ -376,7 +382,7 @@ class BuildGraph:
         # .loads() returns a TOMLDocument,
         # and it behaves like a standard dictionary according to https://github.com/sdispater/tomlkit.
         # in tomlkit 0.7.2, the types are broken (tomlkit#128, #130, #134) so here we convert it to Dict.
-        document = cast(Dict, tomlkit.loads(txt))
+        document = cast(Dict[str, Dict[str, Any]], tomlkit.loads(txt))
 
         for function_uuid, hashing_info in function_content.items():
             if function_uuid in document.get(BuildGraph.FUNCTION_BUILD_DEFINITIONS, {}):
@@ -394,7 +400,7 @@ class BuildGraph:
                 layer_build_definition[MANIFEST_HASH_FIELD] = hashing_info.manifest_hash
                 LOG.info("Updated source_hash and manifest_hash field in build.toml for layer with UUID %s", layer_uuid)
 
-        self._filepath.write_text(tomlkit.dumps(document))  # type: ignore
+        self._filepath.write_text(tomlkit.dumps(cast(TOMLDocument, document)))
 
     def _read(self) -> None:
         """
@@ -501,6 +507,10 @@ class AbstractBuildDefinition:
     def env_vars(self) -> Dict:
         return deepcopy(self._env_vars)
 
+    @abstractmethod
+    def get_resource_full_paths(self) -> str:
+        """Returns string representation of resources' full path information for this build definition"""
+
 
 class LayerBuildDefinition(AbstractBuildDefinition):
     """
@@ -526,6 +536,12 @@ class LayerBuildDefinition(AbstractBuildDefinition):
         # Note(xinhol): In our code, we assume "layer" is never None. We should refactor
         # this and move "layer" out of LayerBuildDefinition to take advantage of type check.
         self.layer: LayerVersion = None  # type: ignore
+
+    def get_resource_full_paths(self) -> str:
+        if not self.layer:
+            LOG.debug("LayerBuildDefinition with uuid (%s) doesn't have a layer assigned to it", self.uuid)
+            return ""
+        return self.layer.full_path
 
     def __str__(self) -> str:
         return (
@@ -569,6 +585,7 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         self,
         runtime: Optional[str],
         codeuri: Optional[str],
+        imageuri: Optional[str],
         packagetype: str,
         architecture: str,
         metadata: Optional[Dict],
@@ -580,6 +597,7 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         super().__init__(source_hash, manifest_hash, env_vars, architecture)
         self.runtime = runtime
         self.codeuri = codeuri
+        self.imageuri = imageuri
         self.packagetype = packagetype
         self.handler = handler
 
@@ -614,17 +632,30 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
         Return the directory path relative to root build directory
         """
         self._validate_functions()
-        return self.functions[0].get_build_dir(artifact_root_dir)
+        build_dir = self.functions[0].get_build_dir(artifact_root_dir)
+        if is_experimental_enabled(ExperimentalFlag.BuildPerformance) and len(self.functions) > 1:
+            # If there are multiple functions with the same build definition,
+            # just put them into one single shared artifacts directory.
+            build_dir = f"{build_dir}-{SHARED_CODEURI_SUFFIX}"
+        return build_dir
+
+    def get_resource_full_paths(self) -> str:
+        """Returns list of functions' full path information as a list of str"""
+        return ", ".join([function.full_path for function in self.functions])
 
     def _validate_functions(self) -> None:
         if not self.functions:
             raise InvalidBuildGraphException("Build definition doesn't have any function definition to build")
 
     def __str__(self) -> str:
+        metadata = self.metadata.copy()
+        if "DockerBuildArgs" in metadata:
+            del metadata["DockerBuildArgs"]
+
         return (
             "BuildDefinition("
             f"{self.runtime}, {self.codeuri}, {self.packagetype}, {self.source_hash}, "
-            f"{self.uuid}, {self.metadata}, {self.env_vars}, {self.architecture}, "
+            f"{self.uuid}, {metadata}, {self.env_vars}, {self.architecture}, "
             f"{[f.functionname for f in self.functions]})"
         )
 
@@ -655,9 +686,16 @@ class FunctionBuildDefinition(AbstractBuildDefinition):
             if self.handler != other.handler:
                 return False
 
+        if self.runtime in COMPILED_RUNTIMES:
+            # For compiled languages, we need to check if handlers within the same CodeUri are the same
+            # if they are different, it should create a separate build definition
+            if self.handler != other.handler:
+                return False
+
         return (
             self.runtime == other.runtime
             and self.codeuri == other.codeuri
+            and self.imageuri == other.imageuri
             and self.packagetype == other.packagetype
             and self.metadata == other.metadata
             and self.env_vars == other.env_vars

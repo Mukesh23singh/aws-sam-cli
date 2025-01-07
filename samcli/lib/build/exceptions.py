@@ -2,6 +2,8 @@
 Build Related Exceptions.
 """
 
+from samcli.commands.exceptions import UserException
+
 
 class UnsupportedBuilderLibraryVersionError(Exception):
     def __init__(self, container_name: str, error_msg: str) -> None:
@@ -10,10 +12,6 @@ class UnsupportedBuilderLibraryVersionError(Exception):
             "this version of SAM CLI. Please upgrade to continue to continue with build. Reason: '{error_msg}'"
         )
         Exception.__init__(self, msg.format(container_name=container_name, error_msg=error_msg))
-
-
-class ContainerBuildNotSupported(Exception):
-    pass
 
 
 class BuildError(Exception):
@@ -44,6 +42,11 @@ class DockerBuildFailed(BuildError):
 class MissingBuildMethodException(BuildError):
     def __init__(self, msg: str) -> None:
         BuildError.__init__(self, "MissingBuildMethodException", msg)
+
+
+class MissingFunctionHandlerException(UserException):
+    def __init__(self, msg: str) -> None:
+        UserException.__init__(self, msg, "MissingFunctionHandlerException")
 
 
 class InvalidBuildGraphException(Exception):

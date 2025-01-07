@@ -2,15 +2,17 @@
 Tests container manager
 """
 
-import io
 import importlib
 from unittest import TestCase
 from unittest.mock import Mock, patch, MagicMock, ANY, call
 
 import requests
 from docker.errors import APIError, ImageNotFound
+
+import docker
 from samcli.local.docker.manager import ContainerManager, DockerImagePullFailedException
 from samcli.local.docker.lambda_image import RAPID_IMAGE_TAG_PREFIX
+from parameterized import parameterized
 
 
 # pywintypes is not available non-Windows OS,
@@ -33,7 +35,6 @@ def patched_modules():
 
 class TestContainerManager_init(TestCase):
     def test_must_initialize_with_default_value(self):
-
         manager = ContainerManager()
         self.assertFalse(manager.skip_pull_image)
 
@@ -106,7 +107,7 @@ class TestContainerManager_run(TestCase):
 
     def test_must_not_pull_image_if_image_is_rapid_image(self):
         input_data = "input data"
-        rapid_image_name = f"Mock_image_name:{RAPID_IMAGE_TAG_PREFIX}-1.0.0"
+        rapid_image_name = f"Mock_image_name/python:3.9-{RAPID_IMAGE_TAG_PREFIX}-x86_64"
 
         self.manager.has_image = Mock()
         self.manager.pull_image = Mock()
@@ -219,18 +220,29 @@ class TestContainerManager_pull_image(TestCase):
         self.manager = ContainerManager(docker_client=self.mock_docker_client)
 
     def test_must_pull_and_print_progress_dots(self):
-
-        stream = io.StringIO()
+        stream = Mock()
         pull_result = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
         self.mock_docker_client.api.pull.return_value = pull_result
-        expected_stream_output = "\nFetching {} Docker container image...{}\n".format(
-            self.image_name, "." * len(pull_result)  # Progress bar will print one dot per response from pull API
-        )
+        expected_stream_calls = [
+            call(f"\nFetching {self.image_name}:latest Docker container image..."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("."),
+            call("\n"),
+        ]
 
         self.manager.pull_image(self.image_name, stream=stream)
 
         self.mock_docker_client.api.pull.assert_called_with(self.image_name, stream=True, decode=True, tag="latest")
-        self.assertEqual(stream.getvalue(), expected_stream_output)
+
+        stream.write_str.assert_has_calls(expected_stream_calls)
 
     def test_must_raise_if_image_not_found(self):
         msg = "some error"
@@ -269,6 +281,15 @@ class TestContainerManager_pull_image(TestCase):
 
 
 class TestContainerManager_is_docker_reachable(TestCase):
+
+    def tearDown(self) -> None:
+        import samcli.local.docker.manager as manager_module
+        import samcli.local.docker.utils as docker_utils
+
+        importlib.reload(manager_module)
+        importlib.reload(docker_utils)
+        return super().tearDown()
+
     def setUp(self):
         self.ping_mock = Mock()
 
@@ -306,9 +327,14 @@ class TestContainerManager_is_docker_reachable(TestCase):
 
         self.assertFalse(is_reachable)
 
-    def test_must_return_false_if_ping_raises_connection_error(self):
-        self.ping_mock.side_effect = requests.exceptions.ConnectionError("error")
-
+    @parameterized.expand(
+        [
+            (requests.exceptions.ConnectionError,),
+            (requests.exceptions.ReadTimeout,),
+        ]
+    )
+    def test_must_return_false_if_ping_raises_requests_error(self, requests_exception):
+        self.ping_mock.side_effect = requests_exception("error")
         is_reachable = self.manager.is_docker_reachable
 
         self.assertFalse(is_reachable)
@@ -321,7 +347,7 @@ class TestContainerManager_is_docker_reachable(TestCase):
             importlib.reload(manager_module)
             importlib.reload(docker_utils)
             manager = manager_module.ContainerManager(docker_client=self.docker_client_mock)
-            import pywintypes  # pylint: disable=import-error
+            import pywintypes
 
             self.ping_mock.side_effect = pywintypes.error("pywintypes.error")
             is_reachable = manager.is_docker_reachable
@@ -331,7 +357,6 @@ class TestContainerManager_is_docker_reachable(TestCase):
         importlib.reload(manager_module)
 
     def test_must_return_True_simulate_non_windows_platform(self):
-
         # Mock these modules to simulate a Windows environment
         platform_mock = Mock()
         platform_mock.system.return_value = "Darwin"
@@ -362,21 +387,40 @@ class TestContainerManager_has_image(TestCase):
         self.manager = ContainerManager(docker_client=self.mock_docker_client)
 
     def test_must_find_an_image(self):
-
         self.assertTrue(self.manager.has_image(self.image_name))
 
     def test_must_not_find_image(self):
-
         self.mock_docker_client.images.get.side_effect = ImageNotFound("test")
         self.assertFalse(self.manager.has_image(self.image_name))
 
 
 class TestContainerManager_stop(TestCase):
     def test_must_call_delete_on_container(self):
-
         manager = ContainerManager()
         container = Mock()
         container.delete = Mock()
 
         manager.stop(container)
         container.delete.assert_called_with()
+
+
+class TestContainerManager_inspect(TestCase):
+    def test_must_call_inspect_on_container(self):
+        manager = ContainerManager()
+        manager.docker_client = Mock()
+
+        container = "container_id"
+
+        manager.inspect(container)
+        manager.docker_client.docker_client.api.inspect_container(container)
+
+    @patch("samcli.local.docker.manager.LOG")
+    def test_must_fail_with_error_message(self, mock_log):
+        manager = ContainerManager()
+        manager.docker_client.api.inspect_container = Mock()
+        manager.docker_client.api.inspect_container.side_effect = [docker.errors.APIError("Failed")]
+
+        return_val = manager.inspect("container_id")
+
+        self.assertEqual(return_val, False)
+        mock_log.debug.assert_called_once_with("Failed to call Docker inspect: %s", "Failed")

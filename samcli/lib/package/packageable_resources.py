@@ -1,10 +1,11 @@
 """
 Code for all Package-able resources
 """
+
 import logging
 import os
 import shutil
-from typing import Optional, Union, Dict
+from typing import Dict, Optional, Union, cast
 
 import jmespath
 from botocore.utils import set_value_from_jmespath
@@ -14,43 +15,44 @@ from samcli.lib.package.ecr_uploader import ECRUploader
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.package.uploaders import Destination, Uploaders
 from samcli.lib.package.utils import (
-    resource_not_packageable,
-    is_local_file,
-    is_zip_file,
     copy_to_temp_dir,
+    is_ecr_url,
+    is_local_file,
+    is_path_value_valid,
+    is_s3_protocol_url,
+    is_zip_file,
+    resource_not_packageable,
     upload_local_artifacts,
     upload_local_image_artifacts,
-    is_s3_protocol_url,
-    is_path_value_valid,
-    is_ecr_url,
 )
-
+from samcli.lib.utils import graphql_api
+from samcli.lib.utils.packagetype import IMAGE, ZIP
 from samcli.lib.utils.resources import (
-    AWS_SERVERLESSREPO_APPLICATION,
-    AWS_SERVERLESS_FUNCTION,
-    AWS_SERVERLESS_API,
-    AWS_SERVERLESS_HTTPAPI,
+    AWS_APIGATEWAY_RESTAPI,
+    AWS_APIGATEWAY_V2_API,
+    AWS_APPSYNC_FUNCTIONCONFIGURATION,
     AWS_APPSYNC_GRAPHQLSCHEMA,
     AWS_APPSYNC_RESOLVER,
-    AWS_APPSYNC_FUNCTIONCONFIGURATION,
-    AWS_LAMBDA_FUNCTION,
-    AWS_APIGATEWAY_RESTAPI,
-    AWS_SERVERLESS_STATEMACHINE,
-    AWS_ELASTICBEANSTALK_APPLICATIONVERSION,
-    AWS_LAMBDA_LAYERVERSION,
-    AWS_SERVERLESS_LAYERVERSION,
-    AWS_GLUE_JOB,
-    AWS_STEPFUNCTIONS_STATEMACHINE,
     AWS_CLOUDFORMATION_MODULEVERSION,
     AWS_CLOUDFORMATION_RESOURCEVERSION,
-    METADATA_WITH_LOCAL_PATHS,
-    RESOURCES_WITH_LOCAL_PATHS,
-    RESOURCES_WITH_IMAGE_COMPONENT,
     AWS_ECR_REPOSITORY,
-    AWS_APIGATEWAY_V2_API,
+    AWS_ELASTICBEANSTALK_APPLICATIONVERSION,
+    AWS_GLUE_JOB,
+    AWS_LAMBDA_FUNCTION,
+    AWS_LAMBDA_LAYERVERSION,
+    AWS_SERVERLESS_API,
+    AWS_SERVERLESS_FUNCTION,
+    AWS_SERVERLESS_GRAPHQLAPI,
+    AWS_SERVERLESS_HTTPAPI,
+    AWS_SERVERLESS_LAYERVERSION,
+    AWS_SERVERLESS_STATEMACHINE,
+    AWS_SERVERLESSREPO_APPLICATION,
+    AWS_STEPFUNCTIONS_STATEMACHINE,
+    METADATA_WITH_LOCAL_PATHS,
+    RESOURCES_WITH_IMAGE_COMPONENT,
+    RESOURCES_WITH_LOCAL_PATHS,
 )
-
-from samcli.lib.utils.packagetype import IMAGE, ZIP
+from samcli.lib.utils.s3 import parse_s3_url
 
 LOG = logging.getLogger(__name__)
 
@@ -91,7 +93,7 @@ class ResourceZip(Resource):
     Base class representing a CloudFormation resource that can be exported
     """
 
-    RESOURCE_TYPE: Optional[str] = None
+    RESOURCE_TYPE: str = ""
     PROPERTY_NAME: str = ""
     PACKAGE_NULL_PROPERTY = True
     # Set this property to True in base class if you want the exporter to zip
@@ -135,30 +137,42 @@ class ResourceZip(Resource):
             if temp_dir:
                 shutil.rmtree(temp_dir)
 
-    def do_export(self, resource_id, resource_dict, parent_dir):
+    def do_export(
+        self,
+        resource_id,
+        resource_dict,
+        parent_dir,
+        property_path: Optional[str] = None,
+        local_path: Optional[str] = None,
+    ):
         """
         Default export action is to upload artifacts and set the property to
         S3 URL of the uploaded object
         If code signing configuration is provided for function/layer, uploaded artifact
         will be replaced by signed artifact location
         """
+        if property_path is None:
+            property_path = self.PROPERTY_NAME
+        uploader = cast(S3Uploader, self.uploader)
         # code signer only accepts files which has '.zip' extension in it
         # so package artifact with '.zip' if it is required to be signed
         should_sign_package = self.code_signer.should_sign_package(resource_id)
         artifact_extension = "zip" if should_sign_package else None
         uploaded_url = upload_local_artifacts(
+            self.RESOURCE_TYPE,
             resource_id,
             resource_dict,
-            self.PROPERTY_NAME,
+            property_path,
             parent_dir,
-            self.uploader,
+            uploader,
             artifact_extension,
+            local_path,
         )
         if should_sign_package:
             uploaded_url = self.code_signer.sign_package(
-                resource_id, uploaded_url, self.uploader.get_version_of_artifact(uploaded_url)
+                resource_id, uploaded_url, uploader.get_version_of_artifact(uploaded_url)
             )
-        set_value_from_jmespath(resource_dict, self.PROPERTY_NAME, uploaded_url)
+        set_value_from_jmespath(resource_dict, property_path, uploaded_url)
 
     def delete(self, resource_id, resource_dict):
         """
@@ -184,7 +198,7 @@ class ResourceZip(Resource):
         # artifact, as deletion of intrinsic ref function artifacts is not supported yet.
         # TODO: Allow deletion of S3 artifacts with intrinsic ref functions.
         if resource_path and isinstance(resource_path, str):
-            return self.uploader.parse_s3_url(resource_path)
+            return parse_s3_url(resource_path)
         return {"Bucket": None, "Key": None}
 
 
@@ -325,10 +339,10 @@ class ResourceWithS3UrlDict(ResourceZip):
         """
 
         artifact_s3_url = upload_local_artifacts(
-            resource_id, resource_dict, self.PROPERTY_NAME, parent_dir, self.uploader
+            self.RESOURCE_TYPE, resource_id, resource_dict, self.PROPERTY_NAME, parent_dir, self.uploader
         )
 
-        parsed_url = S3Uploader.parse_s3_url(
+        parsed_url = parse_s3_url(
             artifact_s3_url,
             bucket_name_property=self.BUCKET_NAME_PROPERTY,
             object_key_property=self.OBJECT_KEY_PROPERTY,
@@ -429,6 +443,14 @@ class AppSyncResolverResponseTemplateResource(ResourceZip):
     PACKAGE_NULL_PROPERTY = False
 
 
+class AppSyncResolverCodeResource(ResourceZip):
+    RESOURCE_TYPE = AWS_APPSYNC_RESOLVER
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][2]
+    # Don't package the directory if CodeS3Location is omitted.
+    # Necessary to support CodeS3Location
+    PACKAGE_NULL_PROPERTY = False
+
+
 class AppSyncFunctionConfigurationRequestTemplateResource(ResourceZip):
     RESOURCE_TYPE = AWS_APPSYNC_FUNCTIONCONFIGURATION
     PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][0]
@@ -442,6 +464,14 @@ class AppSyncFunctionConfigurationResponseTemplateResource(ResourceZip):
     PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][1]
     # Don't package the directory if ResponseMappingTemplateS3Location is omitted.
     # Necessary to support ResponseMappingTemplate
+    PACKAGE_NULL_PROPERTY = False
+
+
+class AppSyncFunctionConfigurationCodeResource(ResourceZip):
+    RESOURCE_TYPE = AWS_APPSYNC_FUNCTIONCONFIGURATION
+    PROPERTY_NAME = RESOURCES_WITH_LOCAL_PATHS[RESOURCE_TYPE][2]
+    # Don't package the directory if CodeS3Location is omitted.
+    # Necessary to support CodeS3Location
     PACKAGE_NULL_PROPERTY = False
 
 
@@ -570,6 +600,85 @@ class ECRResource(Resource):
         return jmespath.search(self.PROPERTY_NAME, resource_dict)
 
 
+class GraphQLApiSchemaResource(ResourceZip):
+    RESOURCE_TYPE = AWS_SERVERLESS_GRAPHQLAPI
+    PROPERTY_NAME = graphql_api.SCHEMA_ARTIFACT_PROPERTY
+    # Don't package the directory if SchemaUri is omitted.
+    # Necessary to support SchemaInline
+    PACKAGE_NULL_PROPERTY = False
+
+
+class GraphQLApiCodeResource(ResourceZip):
+    """CodeUri for GraphQLApi resource.
+
+    There can be more than a single instance of CodeUri property in GraphQLApi Resolvers and Functions.
+    This class handles them all.
+
+    GraphQLApi dict shape looks like the following (yaml representation)
+    >>> Resolvers:
+            Mutation:
+                Resolver1:
+                    CodeUri: ...
+                    Pipeline:
+                    - Func1
+                    - Func2
+            Query:
+                Resolver2:
+                    CodeUri: ...
+                    Pipeline:
+                    - Func3
+        Functions:
+            Func1:
+                CodeUri: ...
+            Func2:
+                CodeUri: ...
+            Func3:
+                CodeUri: ...
+        ... # other properties, which are not important here
+    """
+
+    RESOURCE_TYPE = AWS_SERVERLESS_GRAPHQLAPI
+    PROPERTY_NAME = graphql_api.CODE_ARTIFACT_PROPERTY
+    # if CodeUri is omitted the directory is not packaged because it's necessary to support CodeInline
+    PACKAGE_NULL_PROPERTY = False
+
+    def export(self, resource_id: str, resource_dict: Optional[Dict], parent_dir: str):
+        if resource_dict is None:
+            return
+
+        if resource_not_packageable(resource_dict):
+            return
+
+        # to be able to set different nested properties to S3 uri, paths are necessary
+        # jmespath doesn't provide that functionality, thus custom implementation
+        paths_values = graphql_api.find_all_paths_and_values(self.PROPERTY_NAME, resource_dict)
+        for property_path, property_value in paths_values:
+            if isinstance(property_value, dict):
+                LOG.debug("Property %s of %s resource is not a URL", self.PROPERTY_NAME, resource_id)
+                return
+
+            # If property is a file but not a zip file, place file in temp
+            # folder and send the temp folder to be zipped
+            temp_dir = None
+            if is_local_file(property_value) and not is_zip_file(property_value) and self.FORCE_ZIP:
+                temp_dir = copy_to_temp_dir(property_value)
+                set_value_from_jmespath(resource_dict, property_path, temp_dir)
+
+            try:
+                self.do_export(
+                    resource_id, resource_dict, parent_dir, property_path=property_path, local_path=property_value
+                )
+
+            except Exception as ex:
+                LOG.debug("Unable to export", exc_info=ex)
+                raise exceptions.ExportFailedError(
+                    resource_id=resource_id, property_name=property_path, property_value=property_value, ex=ex
+                )
+            finally:
+                if temp_dir:
+                    shutil.rmtree(temp_dir)
+
+
 RESOURCES_EXPORT_LIST = [
     ServerlessFunctionResource,
     ServerlessFunctionImageResource,
@@ -579,8 +688,10 @@ RESOURCES_EXPORT_LIST = [
     GraphQLSchemaResource,
     AppSyncResolverRequestTemplateResource,
     AppSyncResolverResponseTemplateResource,
+    AppSyncResolverCodeResource,
     AppSyncFunctionConfigurationRequestTemplateResource,
     AppSyncFunctionConfigurationResponseTemplateResource,
+    AppSyncFunctionConfigurationCodeResource,
     ApiGatewayRestApiResource,
     ApiGatewayV2Resource,
     StepFunctionsStateMachineResource,
@@ -593,6 +704,8 @@ RESOURCES_EXPORT_LIST = [
     CloudFormationModuleVersionModulePackage,
     CloudFormationResourceVersionSchemaHandlerPackage,
     ECRResource,
+    GraphQLApiSchemaResource,
+    GraphQLApiCodeResource,
 ]
 
 METADATA_EXPORT_LIST = [ServerlessRepoApplicationReadme, ServerlessRepoApplicationLicense]

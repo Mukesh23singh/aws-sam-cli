@@ -3,17 +3,17 @@ Downloads Layers locally
 """
 
 import logging
+import uuid
 from pathlib import Path
 from typing import List
 
 import boto3
-from botocore.exceptions import NoCredentialsError, ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 
-from samcli.lib.providers.provider import Stack, LayerVersion
-from samcli.lib.utils.codeuri import resolve_code_path
-from samcli.local.lambdafn.zip import unzip_from_uri
 from samcli.commands.local.cli_common.user_exceptions import CredentialsRequired, ResourceNotFound
-
+from samcli.lib.providers.provider import LayerVersion, Stack
+from samcli.lib.utils.codeuri import resolve_code_path
+from samcli.local.lambdafn.remote_files import unzip_from_uri
 
 LOG = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class LayerDownloader:
             LOG.info("%s is already cached. Skipping download", layer.arn)
             return layer
 
-        layer_zip_path = layer.codeuri + ".zip"
+        layer_zip_path = f"{layer.codeuri}_{uuid.uuid4().hex}.zip"
         layer_zip_uri = self._fetch_layer_uri(layer)
         unzip_from_uri(
             layer_zip_uri,

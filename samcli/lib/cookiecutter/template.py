@@ -2,6 +2,7 @@
 This is the core module of the cookiecutter workflow, it defines how to create a template, prompt the user for
 values of the context and how to generate a project from the given template and provided context
 """
+
 import logging
 from typing import Dict, List, Optional
 
@@ -10,7 +11,8 @@ from cookiecutter.main import cookiecutter
 
 from samcli.commands.exceptions import UserException
 from samcli.lib.init.arbitrary_project import generate_non_cookiecutter_project
-from .exceptions import GenerateProjectFailedError, InvalidLocationError, PreprocessingError, PostprocessingError
+
+from .exceptions import GenerateProjectFailedError, InvalidLocationError, PostprocessingError, PreprocessingError
 from .interactive_flow import InteractiveFlow
 from .plugin import Plugin
 from .processor import Processor
@@ -121,6 +123,7 @@ class Template:
         """
         try:
             context = context if context else {}
+            context["shared_values"] = "default"
             for flow in self._interactive_flows:
                 context = flow.run(context)
             return context

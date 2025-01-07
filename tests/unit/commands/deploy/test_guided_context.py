@@ -35,10 +35,8 @@ class TestGuidedContext(TestCase):
         self.companion_stack_manager_mock.return_value.get_unreferenced_repos.return_value = [
             self.unreferenced_repo_mock
         ]
-        self.companion_stack_manager_mock.return_value.get_repo_uri = (
-            lambda repo: "123456789012.dkr.ecr.us-east-1.amazonaws.com/test2"
-            if repo == self.unreferenced_repo_mock
-            else None
+        self.companion_stack_manager_mock.return_value.get_repo_uri = lambda repo: (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/test2" if repo == self.unreferenced_repo_mock else None
         )
 
         self.verify_image_patch = patch(
@@ -136,7 +134,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -178,7 +176,6 @@ class TestGuidedContext(TestCase):
         patched_prompt,
         get_resource_full_path_by_id_mock,
     ):
-
         patched_signer_config_per_function.return_value = (None, None)
         patched_tag_translation.return_value = "helloworld-123456-v1"
         function_mock = MagicMock()
@@ -204,7 +201,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -233,6 +230,7 @@ class TestGuidedContext(TestCase):
             call("\t#Shows you resources changes to be deployed and require a 'Y' to initiate deploy"),
             call("\t#SAM needs permission to be able to create roles to connect to the resources in your template"),
             call("\t#Preserves the state of previously provisioned resources when an operation fails"),
+            call("\n\tManaged S3 bucket: managed_s3_stack", bold=True),
         ]
         self.assertEqual(expected_click_secho_calls, patched_click_secho.call_args_list)
 
@@ -282,7 +280,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -309,6 +307,7 @@ class TestGuidedContext(TestCase):
             call("\t#Shows you resources changes to be deployed and require a 'Y' to initiate deploy"),
             call("\t#SAM needs permission to be able to create roles to connect to the resources in your template"),
             call("\t#Preserves the state of previously provisioned resources when an operation fails"),
+            call("\n\tManaged S3 bucket: managed_s3_stack", bold=True),
         ]
         self.assertEqual(expected_click_secho_calls, patched_click_secho.call_args_list)
 
@@ -405,7 +404,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -432,6 +431,7 @@ class TestGuidedContext(TestCase):
             call("\t#Shows you resources changes to be deployed and require a 'Y' to initiate deploy"),
             call("\t#SAM needs permission to be able to create roles to connect to the resources in your template"),
             call("\t#Preserves the state of previously provisioned resources when an operation fails"),
+            call("\n\tManaged S3 bucket: managed_s3_stack", bold=True),
         ]
         self.assertEqual(expected_click_secho_calls, patched_click_secho.call_args_list)
 
@@ -483,7 +483,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -514,6 +514,7 @@ class TestGuidedContext(TestCase):
             call("\t#Shows you resources changes to be deployed and require a 'Y' to initiate deploy"),
             call("\t#SAM needs permission to be able to create roles to connect to the resources in your template"),
             call("\t#Preserves the state of previously provisioned resources when an operation fails"),
+            call("\n\tManaged S3 bucket: managed_s3_stack", bold=True),
         ]
         self.assertEqual(expected_click_secho_calls, patched_click_secho.call_args_list)
 
@@ -699,7 +700,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -763,7 +764,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -822,7 +823,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),
@@ -967,7 +968,7 @@ class TestGuidedContext(TestCase):
             call(f"\t{self.gc.start_bold}Allow SAM CLI IAM role creation{self.gc.end_bold}", default=True),
             call(f"\t{self.gc.start_bold}Disable rollback{self.gc.end_bold}", default=False),
             call(
-                f"\t{self.gc.start_bold}HelloWorldFunction may not have authorization defined, Is this okay?{self.gc.end_bold}",
+                f"\t{self.gc.start_bold}HelloWorldFunction has no authentication. Is this okay?{self.gc.end_bold}",
                 default=False,
             ),
             call(f"\t{self.gc.start_bold}Save arguments to configuration file{self.gc.end_bold}", default=True),

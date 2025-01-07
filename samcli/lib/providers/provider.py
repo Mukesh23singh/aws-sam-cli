@@ -2,29 +2,31 @@
 A provider class that can parse and return Lambda Functions from a variety of sources. A SAM template is one such
 source
 """
+
 import hashlib
 import logging
 import os
 import posixpath
 from collections import namedtuple
-from typing import Any, Set, NamedTuple, Optional, List, Dict, Tuple, Union, cast, Iterator, TYPE_CHECKING
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Set, Union, cast
 
 from samcli.commands.local.cli_common.user_exceptions import (
+    InvalidFunctionPropertyType,
     InvalidLayerVersionArn,
     UnsupportedIntrinsic,
-    InvalidFunctionPropertyType,
 )
 from samcli.lib.providers.sam_base_provider import SamBaseProvider
 from samcli.lib.samlib.resource_metadata_normalizer import (
-    ResourceMetadataNormalizer,
     SAM_METADATA_SKIP_BUILD_KEY,
     SAM_RESOURCE_ID_KEY,
+    ResourceMetadataNormalizer,
 )
 from samcli.lib.utils.architecture import X86_64
-
-if TYPE_CHECKING:  # pragma: no cover
-    # avoid circular import, https://docs.python.org/3/library/typing.html#typing.TYPE_CHECKING
-    from samcli.local.apigw.local_apigw_service import Route
+from samcli.lib.utils.packagetype import IMAGE
+from samcli.lib.utils.path_utils import check_path_valid_type
+from samcli.local.apigw.route import Route
 
 LOG = logging.getLogger(__name__)
 
@@ -33,6 +35,30 @@ CORS_METHODS_HEADER = "Access-Control-Allow-Methods"
 CORS_HEADERS_HEADER = "Access-Control-Allow-Headers"
 CORS_CREDENTIALS_HEADER = "Access-Control-Allow-Credentials"
 CORS_MAX_AGE_HEADER = "Access-Control-Max-Age"
+
+
+class FunctionBuildInfo(Enum):
+    """
+    Represents information about function's build, see values for details
+    """
+
+    # buildable
+    BuildableZip = "BuildableZip", "Regular ZIP function which can be build with SAM CLI"
+    BuildableImage = "BuildableImage", "Regular IMAGE function which can be build with SAM CLI"
+    # non-buildable
+    InlineCode = "InlineCode", "A ZIP function which has inline code, non buildable"
+    PreZipped = "PreZipped", "A ZIP function which points to a .zip file, non buildable"
+    SkipBuild = "SkipBuild", "A Function which is denoted with SkipBuild in metadata, non buildable"
+    NonBuildableImage = (
+        "NonBuildableImage",
+        "An IMAGE function which is missing some information to build, non buildable",
+    )
+
+    def is_buildable(self) -> bool:
+        """
+        Returns whether this build info can be buildable nor not
+        """
+        return self in {FunctionBuildInfo.BuildableZip, FunctionBuildInfo.BuildableImage}
 
 
 class Function(NamedTuple):
@@ -82,8 +108,14 @@ class Function(NamedTuple):
     architectures: Optional[List[str]]
     # The function url configuration
     function_url_config: Optional[Dict]
+    # FunctionBuildInfo see implementation doc for its details
+    function_build_info: FunctionBuildInfo
     # The path of the stack relative to the root stack, it is empty for functions in root stack
     stack_path: str = ""
+    # Configuration for runtime management. Includes the fields `UpdateRuntimeOn` and `RuntimeVersionArn` (optional).
+    runtime_management_config: Optional[Dict] = None
+    # LoggingConfig for Advanced logging
+    logging_config: Optional[Dict] = None
 
     @property
     def full_path(self) -> str:
@@ -103,7 +135,7 @@ class Function(NamedTuple):
         resource. It means that the customer is building the Lambda function code outside SAM, and the provided code
         path is already built.
         """
-        return self.metadata.get(SAM_METADATA_SKIP_BUILD_KEY, False) if self.metadata else False
+        return get_skip_build(self.metadata)
 
     def get_build_dir(self, build_root_dir: str) -> str:
         """
@@ -135,6 +167,16 @@ class Function(NamedTuple):
                 f"Function {self.name} property Architectures should be a list of length 1"
             )
         return str(arch_list[0])
+
+    def __str__(self) -> str:
+        metadata = None if not self.metadata else self.metadata.copy()
+        if metadata and "DockerBuildArgs" in metadata:
+            del metadata["DockerBuildArgs"]
+
+        copy = self._asdict()
+        if metadata:
+            copy["metadata"] = metadata
+        return f"Function({copy})"
 
 
 class ResourcesToBuildCollector:
@@ -210,13 +252,15 @@ class LayerVersion:
         self._arn = arn
         self._codeuri = codeuri
         self.is_defined_within_template = bool(codeuri)
+        self._metadata = metadata
         self._build_method = cast(Optional[str], metadata.get("BuildMethod", None))
         self._compatible_runtimes = compatible_runtimes
+        self._custom_layer_id = metadata.get(SAM_RESOURCE_ID_KEY)
 
         self._build_architecture = cast(str, metadata.get("BuildArchitecture", X86_64))
         self._compatible_architectures = compatible_architectures
+
         self._skip_build = bool(metadata.get(SAM_METADATA_SKIP_BUILD_KEY, False))
-        self._custom_layer_id = metadata.get(SAM_RESOURCE_ID_KEY)
 
     @staticmethod
     def _compute_layer_version(is_defined_within_template: bool, arn: str) -> Optional[int]:
@@ -280,6 +324,10 @@ class LayerVersion:
         return LayerVersion.LAYER_NAME_DELIMETER.join(
             [layer_name, layer_version, hashlib.sha256(arn.encode("utf-8")).hexdigest()[0:10]]
         )
+
+    @property
+    def metadata(self) -> Dict:
+        return self._metadata
 
     @property
     def stack_path(self) -> str:
@@ -431,9 +479,11 @@ class Api:
         return list(self.binary_media_types_set)
 
 
-_CorsTuple = namedtuple("Cors", ["allow_origin", "allow_methods", "allow_headers", "allow_credentials", "max_age"])
+_CorsTuple = namedtuple(
+    "_CorsTuple", ["allow_origin", "allow_methods", "allow_headers", "allow_credentials", "max_age"]
+)
 
-_CorsTuple.__new__.__defaults__ = (  # type: ignore
+_CorsTuple.__new__.__defaults__ = (
     None,  # Allow Origin defaults to None
     None,  # Allow Methods is optional and defaults to empty
     None,  # Allow Headers is optional and defaults to empty
@@ -444,26 +494,64 @@ _CorsTuple.__new__.__defaults__ = (  # type: ignore
 
 class Cors(_CorsTuple):
     @staticmethod
-    def cors_to_headers(cors: Optional["Cors"]) -> Dict[str, Union[int, str]]:
+    def cors_to_headers(
+        cors: Optional["Cors"], request_origin: Optional[str], event_type: str
+    ) -> Dict[str, Union[int, str]]:
         """
         Convert CORS object to headers dictionary
         Parameters
         ----------
         cors list(samcli.commands.local.lib.provider.Cors)
             CORS configuration objcet
+        request_origin str
+            Origin of the request, e.g. https://example.com:8080
+        event_type str
+            The type of the APIGateway resource that contain the route, either Api, or HttpApi
         Returns
         -------
             Dictionary with CORS headers
         """
         if not cors:
             return {}
-        headers = {
-            CORS_ORIGIN_HEADER: cors.allow_origin,
-            CORS_METHODS_HEADER: cors.allow_methods,
-            CORS_HEADERS_HEADER: cors.allow_headers,
-            CORS_CREDENTIALS_HEADER: cors.allow_credentials,
-            CORS_MAX_AGE_HEADER: cors.max_age,
-        }
+
+        if event_type == Route.API:
+            # the CORS behaviour in Rest API gateway is to return whatever defined in the ResponseParameters of
+            # the method integration resource
+            headers = {
+                CORS_ORIGIN_HEADER: cors.allow_origin,
+                CORS_METHODS_HEADER: cors.allow_methods,
+                CORS_HEADERS_HEADER: cors.allow_headers,
+                CORS_CREDENTIALS_HEADER: cors.allow_credentials,
+                CORS_MAX_AGE_HEADER: cors.max_age,
+            }
+        else:
+            # Resource processing start here.
+            # The following code is based on the following spec:
+            # https://www.w3.org/TR/2020/SPSD-cors-20200602/#resource-processing-model
+
+            if not request_origin:
+                return {}
+
+            # cors.allow_origin can be either a single origin or comma separated list of origins
+            allowed_origins = cors.allow_origin.split(",") if cors.allow_origin else list()
+            allowed_origins = [origin.strip() for origin in allowed_origins]
+
+            matched_origin = None
+            if "*" in allowed_origins:
+                matched_origin = "*"
+            elif request_origin in allowed_origins:
+                matched_origin = request_origin
+
+            if matched_origin is None:
+                return {}
+
+            headers = {
+                CORS_ORIGIN_HEADER: matched_origin,
+                CORS_METHODS_HEADER: cors.allow_methods,
+                CORS_HEADERS_HEADER: cors.allow_headers,
+                CORS_CREDENTIALS_HEADER: cors.allow_credentials,
+                CORS_MAX_AGE_HEADER: cors.max_age,
+            }
         # Filters out items in the headers dictionary that isn't empty.
         # This is required because the flask Headers dict will send an invalid 'None' string
         return {h_key: h_value for h_key, h_value in headers.items() if h_value is not None}
@@ -483,7 +571,7 @@ class AbstractApiProvider:
         raise NotImplementedError("not implemented")
 
 
-class Stack(NamedTuple):
+class Stack:
     """
     A class encapsulate info about a stack/sam-app resource,
     including its content, parameter overrides, file location, logicalID
@@ -504,10 +592,28 @@ class Stack(NamedTuple):
     # metadata
     metadata: Optional[Dict] = None
 
+    def __init__(
+        self,
+        parent_stack_path: str,
+        name: str,
+        location: str,
+        parameters: Optional[Dict],
+        template_dict: Dict,
+        metadata: Optional[Dict[str, str]] = None,
+    ):
+        self.parent_stack_path = parent_stack_path
+        self.name = name
+        self.location = location
+        self.parameters = parameters
+        self.template_dict = template_dict
+        self.metadata = metadata
+        self._resources: Optional[Dict] = None
+        self._raw_resources: Optional[Dict] = None
+
     @property
     def stack_id(self) -> str:
-        _metadata = self.metadata if self.metadata else {}
-        return _metadata.get(SAM_RESOURCE_ID_KEY, self.name) if self.metadata else self.name
+        _metadata: Dict[str, str] = self.metadata or {}
+        return _metadata.get(SAM_RESOURCE_ID_KEY, self.name)
 
     @property
     def stack_path(self) -> str:
@@ -533,9 +639,21 @@ class Stack(NamedTuple):
         Return the resources dictionary where SAM plugins have been run
         and parameter values have been substituted.
         """
-        processed_template_dict: Dict = SamBaseProvider.get_template(self.template_dict, self.parameters)
-        resources: Dict = processed_template_dict.get("Resources", {})
-        return resources
+        if self._resources is not None:
+            return self._resources
+        processed_template_dict: Dict[str, Dict] = SamBaseProvider.get_template(self.template_dict, self.parameters)
+        self._resources = processed_template_dict.get("Resources", {})
+        return self._resources
+
+    @property
+    def raw_resources(self) -> Dict:
+        """
+        Return the resources dictionary without running SAM Transform
+        """
+        if self._raw_resources is not None:
+            return self._raw_resources
+        self._raw_resources = cast(Dict, self.template_dict.get("Resources", {}))
+        return self._raw_resources
 
     def get_output_template_path(self, build_root: str) -> str:
         """
@@ -543,6 +661,86 @@ class Stack(NamedTuple):
         """
         # stack_path is always posix path, we need to convert it to path that matches the OS
         return os.path.join(build_root, self.stack_path.replace(posixpath.sep, os.path.sep), "template.yaml")
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, Stack):
+            return (
+                self.is_root_stack == other.is_root_stack
+                and self.location == other.location
+                and self.metadata == other.metadata
+                and self.name == other.name
+                and self.parameters == other.parameters
+                and self.parent_stack_path == other.parent_stack_path
+                and self.stack_id == other.stack_id
+                and self.stack_path == other.stack_path
+                and self.template_dict == other.template_dict
+            )
+        return False
+
+    @staticmethod
+    def get_parent_stack(child_stack: "Stack", stacks: List["Stack"]) -> Optional["Stack"]:
+        """
+        Return parent stack for the given child stack
+        Parameters
+        ----------
+        child_stack Stack
+            the child stack
+        stacks : List[Stack]
+            a list of stack for searching
+        Returns
+        -------
+        Stack
+            parent stack of the given child stack, if the child stack is root, return None
+        """
+        if child_stack.is_root_stack:
+            return None
+
+        parent_stack_path = child_stack.parent_stack_path
+        for stack in stacks:
+            if stack.stack_path == parent_stack_path:
+                return stack
+        return None
+
+    @staticmethod
+    def get_stack_by_full_path(full_path: str, stacks: List["Stack"]) -> Optional["Stack"]:
+        """
+        Return the stack with given full path
+        Parameters
+        ----------
+        full_path str
+            full path of the stack like ChildStack/ChildChildStack
+        stacks : List[Stack]
+            a list of stack for searching
+        Returns
+        -------
+        Stack
+            The stack with the given full path
+        """
+        for stack in stacks:
+            if stack.stack_path == full_path:
+                return stack
+        return None
+
+    @staticmethod
+    def get_child_stacks(stack: "Stack", stacks: List["Stack"]) -> List["Stack"]:
+        """
+        Return child stacks for the given parent stack
+        Parameters
+        ----------
+        stack Stack
+            the parent stack
+        stacks : List[Stack]
+            a list of stack for searching
+        Returns
+        -------
+        List[Stack]
+            child stacks of the given parent stack
+        """
+        child_stacks = []
+        for child in stacks:
+            if not child.is_root_stack and child.parent_stack_path == stack.stack_path:
+                child_stacks.append(child)
+        return child_stacks
 
 
 class ResourceIdentifier:
@@ -723,8 +921,8 @@ def get_all_resource_ids(stacks: List[Stack]) -> List[ResourceIdentifier]:
 
 def get_unique_resource_ids(
     stacks: List[Stack],
-    resource_ids: Optional[Union[List[str], Tuple[str]]],
-    resource_types: Optional[Union[List[str], Tuple[str]]],
+    resource_ids: Optional[Union[List[str]]],
+    resource_types: Optional[Union[List[str]]],
 ) -> Set[ResourceIdentifier]:
     """Get unique resource IDs for resource_ids and resource_types
 
@@ -732,9 +930,9 @@ def get_unique_resource_ids(
     ----------
     stacks : List[Stack]
         Stacks
-    resource_ids : Optional[Union[List[str], Tuple[str]]]
+    resource_ids : Optional[Union[List[str]]]
         Resource ID strings
-    resource_types : Optional[Union[List[str], Tuple[str]]]
+    resource_types : Optional[Union[List[str]]]
         Resource types
 
     Returns
@@ -753,6 +951,54 @@ def get_unique_resource_ids(
             for resource_id in resource_type_ids:
                 output_resource_ids.add(resource_id)
     return output_resource_ids
+
+
+def get_skip_build(metadata: Optional[Dict[str, bool]]) -> bool:
+    """
+    Returns the value of SkipBuild property from Metadata, False if it is not defined
+    """
+    return metadata.get(SAM_METADATA_SKIP_BUILD_KEY, False) if metadata else False
+
+
+def get_function_build_info(
+    full_path: str,
+    packagetype: str,
+    inlinecode: Optional[str],
+    codeuri: Optional[str],
+    imageuri: Optional[str],
+    metadata: Optional[Dict],
+) -> FunctionBuildInfo:
+    """
+    Populates FunctionBuildInfo from the given information.
+    """
+    if inlinecode:
+        LOG.debug("Skip building inline function: %s", full_path)
+        return FunctionBuildInfo.InlineCode
+
+    if isinstance(codeuri, str) and codeuri.endswith(".zip"):
+        LOG.debug("Skip building zip function: %s", full_path)
+        return FunctionBuildInfo.PreZipped
+
+    if get_skip_build(metadata):
+        LOG.debug("Skip building pre-built function: %s", full_path)
+        return FunctionBuildInfo.SkipBuild
+
+    if packagetype == IMAGE:
+        metadata = metadata or {}
+        dockerfile = cast(str, metadata.get("Dockerfile", ""))
+        docker_context = cast(str, metadata.get("DockerContext", ""))
+        buildable = dockerfile and docker_context
+        loadable = imageuri and check_path_valid_type(imageuri) and Path(imageuri).is_file()
+        if not buildable and not loadable:
+            LOG.debug(
+                "Skip Building %s function, as it is missing either Dockerfile or DockerContext "
+                "metadata properties.",
+                full_path,
+            )
+            return FunctionBuildInfo.NonBuildableImage
+        return FunctionBuildInfo.BuildableImage
+
+    return FunctionBuildInfo.BuildableZip
 
 
 def _get_build_dir(resource: Union[Function, LayerVersion], build_root: str) -> str:

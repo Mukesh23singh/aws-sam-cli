@@ -1,6 +1,9 @@
 """
 Common OS utilities
 """
+
+import errno
+import io
 import logging
 import os
 import shutil
@@ -8,7 +11,8 @@ import stat
 import sys
 import tempfile
 from contextlib import contextmanager
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union, cast
 
 LOG = logging.getLogger(__name__)
 
@@ -69,7 +73,15 @@ def rmtree_callback(function, path, excinfo):
         LOG.debug("rmtree failed in %s for %s, details: %s", function, path, excinfo)
 
 
-def stdout():
+def rmtree_if_exists(path: Union[str, Path]):
+    """Removes given path if the path exists"""
+    path_obj = Path(str(path))
+    if path_obj.exists():
+        LOG.debug("Cleaning up path %s", str(path))
+        shutil.rmtree(path_obj)
+
+
+def stdout() -> io.TextIOWrapper:
     """
     Returns the stdout as a byte stream in a Py2/PY3 compatible manner
 
@@ -78,10 +90,15 @@ def stdout():
     io.BytesIO
         Byte stream of Stdout
     """
-    return sys.stdout.buffer
+    # ensure stdout is utf8
+
+    stdout_text_io = cast(io.TextIOWrapper, sys.stdout)
+    stdout_text_io.reconfigure(encoding="utf-8")
+
+    return stdout_text_io
 
 
-def stderr():
+def stderr() -> io.TextIOWrapper:
     """
     Returns the stderr as a byte stream in a Py2/PY3 compatible manner
 
@@ -90,7 +107,11 @@ def stderr():
     io.BytesIO
         Byte stream of stderr
     """
-    return sys.stderr.buffer
+    # ensure stderr is utf8
+    stderr_text_io = cast(io.TextIOWrapper, sys.stderr)
+    stderr_text_io.reconfigure(encoding="utf-8")
+
+    return stderr_text_io
 
 
 def remove(path):
@@ -158,7 +179,15 @@ def copytree(source, destination, ignore=None):
         if os.path.isdir(new_source):
             copytree(new_source, new_destination, ignore=ignore)
         else:
-            shutil.copy2(new_source, new_destination)
+            try:
+                shutil.copy2(new_source, new_destination)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise e
+
+                # Symlinks do not get copied for Windows using shutil.copy2, which is why
+                # they are handled separately here.
+                create_symlink_or_copy(new_source, new_destination)
 
 
 def convert_files_to_unix_line_endings(path: str, target_files: Optional[List[str]] = None) -> None:
@@ -177,3 +206,16 @@ def convert_to_unix_line_ending(file_path: str) -> None:
     content = content.replace(b"\r\n", b"\n")
     with open(file_path, "wb") as file:
         file.write(content)
+
+
+def create_symlink_or_copy(source: str, destination: str) -> None:
+    """Tries to create symlink, if it fails it will copy source into destination"""
+    LOG.debug("Creating symlink; source: %s, destination: %s", source, destination)
+    try:
+        os.symlink(Path(source).absolute(), Path(destination).absolute())
+    except OSError as ex:
+        LOG.warning(
+            "Symlink operation is failed, falling back to copying files",
+            exc_info=ex if LOG.isEnabledFor(logging.DEBUG) else None,
+        )
+        copytree(source, destination)

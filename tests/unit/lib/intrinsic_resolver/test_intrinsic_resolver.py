@@ -209,6 +209,7 @@ class TestIntrinsicFnFindInMapResolver(TestCase):
                 "Basic": {"Test": {"key": "value"}},
                 "value": {"anotherkey": {"key": "result"}},
                 "result": {"value": {"key": "final"}},
+                "NonStrValue": {"Test": {"key": 0}},
             }
         }
         self.resolver = IntrinsicResolver(symbol_resolver=IntrinsicsSymbolTable(), template=template)
@@ -217,6 +218,11 @@ class TestIntrinsicFnFindInMapResolver(TestCase):
         intrinsic = {"Fn::FindInMap": ["Basic", "Test", "key"]}
         result = self.resolver.intrinsic_property_resolver(intrinsic, True)
         self.assertEqual(result, "value")
+
+    def test_basic_find_in_map_with_non_string_value(self):
+        intrinsic = {"Fn::FindInMap": ["NonStrValue", "Test", "key"]}
+        result = self.resolver.intrinsic_property_resolver(intrinsic, True)
+        self.assertEqual(result, 0)
 
     def test_nested_find_in_map(self):
         intrinsic_base_1 = {"Fn::FindInMap": ["Basic", "Test", "key"]}
@@ -948,7 +954,7 @@ class TestIntrinsicAttribteResolution(TestCase):
             "ReferenceLambdaLayerVersionLambdaFunction": {
                 "Properties": {
                     "Handler": "layer-main.custom_layer_handler",
-                    "Runtime": "python3.6",
+                    "Runtime": "python3.9",
                     "CodeUri": ".",
                     "Layers": [{"Ref": "MyCustomLambdaLayer"}],
                 },
@@ -984,7 +990,7 @@ class TestIntrinsicAttribteResolution(TestCase):
             "ReferenceLambdaLayerVersionLambdaFunction": {
                 "Properties": {
                     "Handler": "layer-main.custom_layer_handler",
-                    "Runtime": "python3.6",
+                    "Runtime": "python3.9",
                     "CodeUri": ".",
                     "Layers": [{"Ref": "MyCustomLambdaLayer"}],
                 },
